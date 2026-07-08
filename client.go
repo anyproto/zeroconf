@@ -156,6 +156,7 @@ func newClient(opts clientOpts) (*client, error) {
 	if (opts.listenOn & IPv4) > 0 {
 		var err error
 		ipv4conn, err = joinUdp4Multicast(ifaceList)
+		tracef("#p2p newClient ipv4 joinUdp4Multicast err %v\n", err)
 		if err != nil {
 			return nil, err
 		}
@@ -165,6 +166,8 @@ func newClient(opts clientOpts) (*client, error) {
 	if (opts.listenOn & IPv6) > 0 {
 		var err error
 		ipv6conn, err = joinUdp6Multicast(ifaceList)
+		tracef("#p2p newClient ipv6 joinUdp4Multicast err %v\n", err)
+
 		if err != nil {
 			return nil, err
 		}
@@ -336,11 +339,14 @@ func (c *client) recv(ctx context.Context, l interface{}, msgCh chan *dns.Msg) {
 	case *ipv6.PacketConn:
 		readFrom = func(b []byte) (n int, src net.Addr, err error) {
 			n, _, src, err = pConn.ReadFrom(b)
+			tracef("#p2p recv ipv6 read from %s %d bytes err %v...\n", src, n, err)
 			return
 		}
 	case *ipv4.PacketConn:
 		readFrom = func(b []byte) (n int, src net.Addr, err error) {
 			n, _, src, err = pConn.ReadFrom(b)
+			tracef("#p2p recv ipv4 read from %s %d bytes err %v...\n", src, n, err)
+
 			return
 		}
 
@@ -465,13 +471,26 @@ func (c *client) sendQuery(msg *dns.Msg, requiredFlags ...NetInterfaceStateFlag)
 			switch runtime.GOOS {
 			case "darwin", "ios", "linux":
 				wcm.IfIndex = intf.Index
+				if err := c.ipv4conn.SetMulticastInterface(&intf.Interface); err != nil {
+					log.Printf("[WARN] mdns: Failed to set multicast interface: %v", err)
+					tracef("#p2p sendQuery ipv4 setMulticastInterface  %s err %v\n", intf.Name, err)
+				}
+				tracef("#p2p sendQuery ipv4 setMulticastInterface  %s err %v\n", intf.Name, err)
+
 			default:
 				if err := c.ipv4conn.SetMulticastInterface(&intf.Interface); err != nil {
 					log.Printf("[WARN] mdns: Failed to set multicast interface: %v", err)
+					tracef("#p2p sendQuery ipv4 setMulticastInterface  %s err %v\n", intf.Name, err)
 				}
+				tracef("#p2p sendQuery ipv4 setMulticastInterface  %s err %v\n", intf.Name, err)
+
 			}
+			start := time.Now()
 			setDeadline(c.writeTimeout, c.ipv4conn)
+			tracef("#p2p sendQuery ipv4 write to %s(%s)...\n", intf.Name, ipv4Addr.String())
 			n, err := c.ipv4conn.WriteTo(buf, &wcm, ipv4Addr)
+			tracef("#p2p sendQuery ipv4 write to %s(%s): err %v(%d bytes) after %dms\n", intf.Name, ipv4Addr.String(), err, n, time.Since(start).Milliseconds())
+
 			if err == nil && n > 0 {
 				intf.SetFlag(NetInterfaceScopeIPv4, NetInterfaceStateFlagMessageSent)
 			}
@@ -495,10 +514,13 @@ func (c *client) sendQuery(msg *dns.Msg, requiredFlags ...NetInterfaceStateFlag)
 				}
 			}
 			setDeadline(c.writeTimeout, c.ipv6conn)
+			start := time.Now()
+			tracef("#p2p sendQuery ipv6 write to %s(%s)...\n", intf.Name, ipv6Addr.String())
 			n, err := c.ipv6conn.WriteTo(buf, &wcm, ipv6Addr)
 			if err == nil && n > 0 {
 				intf.SetFlag(NetInterfaceScopeIPv6, NetInterfaceStateFlagMessageSent)
 			}
+			tracef("#p2p sendQuery ipv6 write to %s(%s): err %v(%d bytes) after %dms\n", intf.Name, ipv6Addr.String(), err, n, time.Since(start).Milliseconds())
 		}
 	}
 	return nil

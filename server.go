@@ -284,6 +284,32 @@ func (s *Server) Shutdown() {
 	s.isShutdown = true
 }
 
+// The recv loops back off on ReadFrom errors so a persistent error (e.g. iOS
+// ENOTCONN after a network change) can't busy-spin a core. Backoff grows on each
+// consecutive error and resets on the first successful read, so a genuine
+// transient recovers fast while a dead socket settles to one syscall every max.
+//
+// The cap only limits the futile poll rate on a socket that is about to be torn
+// down and rebuilt (the network-change hook / periodic refresh does the actual
+// recovery, spawning a fresh recv loop). Shutdown wakes the backoff select
+// instantly, so a large cap never slows a network switch.
+const (
+	recvErrBackoffMin = 50 * time.Millisecond
+	recvErrBackoffMax = 5 * time.Second
+)
+
+// nextRecvBackoff doubles the current backoff up to the cap; a zero (or sub-min)
+// input starts at the minimum.
+func nextRecvBackoff(cur time.Duration) time.Duration {
+	if cur < recvErrBackoffMin {
+		return recvErrBackoffMin
+	}
+	if cur *= 2; cur > recvErrBackoffMax {
+		return recvErrBackoffMax
+	}
+	return cur
+}
+
 // recv4 is a long running routine to receive packets from an interface
 func (s *Server) recv4(c *ipv4.PacketConn) {
 	defer s.refCount.Done()
@@ -291,6 +317,7 @@ func (s *Server) recv4(c *ipv4.PacketConn) {
 		return
 	}
 	buf := make([]byte, 65536)
+	var backoff time.Duration
 	for {
 		select {
 		case <-s.shouldShutdown:
@@ -299,8 +326,20 @@ func (s *Server) recv4(c *ipv4.PacketConn) {
 			var ifIndex int
 			n, cm, from, err := c.ReadFrom(buf)
 			if err != nil {
+				recvStatErr(err) // #p2p hot-path receive stats (busy-spin detector)
+				// A persistent socket error (e.g. iOS ENOTCONN after a network
+				// change) returns instantly; without this backoff the loop pegs a
+				// core at ~1.6M recvmsg/s. Back off (growing) and re-check shutdown.
+				backoff = nextRecvBackoff(backoff)
+				select {
+				case <-s.shouldShutdown:
+					return
+				case <-time.After(backoff):
+				}
 				continue
 			}
+			backoff = 0          // reset backoff on a successful read
+			recvStatRaw(from, n) // #p2p hot-path receive stats
 			if cm != nil {
 				ifIndex = cm.IfIndex
 			}
@@ -316,6 +355,7 @@ func (s *Server) recv6(c *ipv6.PacketConn) {
 		return
 	}
 	buf := make([]byte, 65536)
+	var backoff time.Duration
 	for {
 		select {
 		case <-s.shouldShutdown:
@@ -324,8 +364,20 @@ func (s *Server) recv6(c *ipv6.PacketConn) {
 			var ifIndex int
 			n, cm, from, err := c.ReadFrom(buf)
 			if err != nil {
+				recvStatErr(err) // #p2p hot-path receive stats (busy-spin detector)
+				// A persistent socket error (e.g. iOS ENOTCONN after a network
+				// change) returns instantly; without this backoff the loop pegs a
+				// core at ~1.6M recvmsg/s. Back off (growing) and re-check shutdown.
+				backoff = nextRecvBackoff(backoff)
+				select {
+				case <-s.shouldShutdown:
+					return
+				case <-time.After(backoff):
+				}
 				continue
 			}
+			backoff = 0          // reset backoff on a successful read
+			recvStatRaw(from, n) // #p2p hot-path receive stats
 			if cm != nil {
 				ifIndex = cm.IfIndex
 			}
@@ -339,8 +391,10 @@ func (s *Server) parsePacket(packet []byte, ifIndex int, from net.Addr) error {
 	var msg dns.Msg
 	if err := msg.Unpack(packet); err != nil {
 		// log.Printf("[ERR] zeroconf: Failed to unpack packet: %v", err)
+		recvStatUnpackErr() // #p2p hot-path receive stats
 		return err
 	}
+	recvStatClassify(msg.Response, s.packetForUs(&msg)) // #p2p hot-path receive stats
 	return s.handleQuery(&msg, ifIndex, from)
 }
 
@@ -353,7 +407,10 @@ func (s *Server) handleQuery(query *dns.Msg, ifIndex int, from net.Addr) error {
 
 	// Handle each question
 	var err error
+	tracef("#p2p handleQuery %d: %d questions\n", ifIndex, len(query.Question))
+
 	for _, q := range query.Question {
+
 		resp := dns.Msg{}
 		resp.SetReply(query)
 		resp.Compress = true
@@ -418,6 +475,7 @@ func (s *Server) handleQuestion(q dns.Question, resp *dns.Msg, query *dns.Msg, i
 	if s.service == nil {
 		return nil
 	}
+	tracef("#p2p handleQuestion %d: %+v at %s\n", ifIndex, q, time.Now())
 
 	switch q.Name {
 	case s.service.ServiceTypeName():
@@ -576,6 +634,7 @@ func (s *Server) serviceTypeName(resp *dns.Msg, ttl uint32) {
 // Perform probing & announcement
 // TODO: implement a proper probing & conflict resolution
 func (s *Server) probe() {
+	tracef("#p2p probe at %s\n", time.Now())
 	defer s.refCount.Done()
 
 	q := new(dns.Msg)
@@ -615,6 +674,8 @@ func (s *Server) probe() {
 		return
 	}
 	for i := 0; i < 3; i++ {
+		tracef("#p2p multicastResponse 1 %d at %s\n", i, time.Now())
+
 		if err := s.multicastResponse(q, 0, NetInterfaceStateFlagMulticastJoined); err != nil {
 			log.Println("[ERR] zeroconf: failed to send probe:", err.Error())
 		}
@@ -634,6 +695,7 @@ func (s *Server) probe() {
 	//    at least a factor of two with every response sent.
 	timeout := time.Second
 	for i := 0; i < multicastRepetitions; i++ {
+		tracef("#p2p multicastResponse lookup %d at %s\n", i, time.Now())
 		for _, intf := range s.interfaces {
 			resp := new(dns.Msg)
 			resp.MsgHdr.Response = true
@@ -682,7 +744,7 @@ func (s *Server) unregister() error {
 	resp.Extra = []dns.RR{}
 	s.composeLookupAnswers(resp, 0, 0, true)
 	// cleanup ifaces we have NEVER written successfully. No need to unregister them
-
+	traceln("#p2p unregister")
 	return s.multicastResponse(resp, 0, NetInterfaceStateFlagMulticastJoined, NetInterfaceStateFlagMessageSent)
 }
 
@@ -764,27 +826,32 @@ func (s *Server) unicastResponse(resp *dns.Msg, ifIndex int, from net.Addr) erro
 		return err
 	}
 	addr := from.(*net.UDPAddr)
+	var n int
 	if addr.IP.To4() != nil && s.ipv4conn != nil {
 		if ifIndex != 0 {
 			var wcm ipv4.ControlMessage
 			wcm.IfIndex = ifIndex
 			setDeadline(s.writeTimeout, s.ipv4conn)
-			_, err = s.ipv4conn.WriteTo(buf, &wcm, addr)
+			n, err = s.ipv4conn.WriteTo(buf, &wcm, addr)
 		} else {
 			setDeadline(s.writeTimeout, s.ipv4conn)
-			_, err = s.ipv4conn.WriteTo(buf, nil, addr)
+			n, err = s.ipv4conn.WriteTo(buf, nil, addr)
 		}
+		tracef("#p2p unicastResponse ipv4 write to %d %s(from %s %s): err %v(%d bytes)\n", ifIndex, addr, from.Network(), from.String(), err, n)
+
 		return err
 	} else if s.ipv6conn != nil {
 		if ifIndex != 0 {
 			var wcm ipv6.ControlMessage
 			wcm.IfIndex = ifIndex
 			setDeadline(s.writeTimeout, s.ipv6conn)
-			_, err = s.ipv6conn.WriteTo(buf, &wcm, addr)
+			n, err = s.ipv6conn.WriteTo(buf, &wcm, addr)
 		} else {
 			setDeadline(s.writeTimeout, s.ipv6conn)
-			_, err = s.ipv6conn.WriteTo(buf, nil, addr)
+			n, err = s.ipv6conn.WriteTo(buf, nil, addr)
 		}
+		tracef("#p2p unicastResponse ipv6 write to %d %s(from %s %s): err %v(%d bytes)\n", ifIndex, addr, from.Network(), from.String(), err, n)
+
 		return err
 	} else {
 		return fmt.Errorf("no suitable interface")
@@ -793,7 +860,9 @@ func (s *Server) unicastResponse(resp *dns.Msg, ifIndex int, from net.Addr) erro
 
 // multicastResponse is used to send a multicast response packet
 func (s *Server) multicastResponse(msg *dns.Msg, ifIndex int, requiredFlags ...NetInterfaceStateFlag) error {
+	tracef("#p2p multicastResponse %d: %+v\n", ifIndex, msg)
 	buf, err := msg.Pack()
+
 	if err != nil {
 		return fmt.Errorf("failed to pack msg %v: %w", msg, err)
 	}
@@ -818,6 +887,7 @@ func (s *Server) multicastResponse(msg *dns.Msg, ifIndex int, requiredFlags ...N
 				if err == nil && n > 0 {
 					s.interfaces.GetByIndex(ifIndex).SetFlag(NetInterfaceScopeIPv4, NetInterfaceStateFlagMessageSent)
 				}
+				tracef("#p2p multicastResponse ipv4 write to %d(%s): err %v(%d bytes)\n", ifIndex, v.Name, err, n)
 			}
 
 		} else {
@@ -838,6 +908,8 @@ func (s *Server) multicastResponse(msg *dns.Msg, ifIndex int, requiredFlags ...N
 				if err == nil && n > 0 {
 					intf.SetFlag(NetInterfaceScopeIPv4, NetInterfaceStateFlagMessageSent)
 				}
+				tracef("#p2p multicastResponse ipv4 write to %d(%s): err %v(%d bytes)\n", intf.Index, intf.Name, err, n)
+
 			}
 		}
 	}
@@ -860,6 +932,8 @@ func (s *Server) multicastResponse(msg *dns.Msg, ifIndex int, requiredFlags ...N
 				}
 				setDeadline(s.writeTimeout, s.ipv6conn)
 				n, err := s.ipv6conn.WriteTo(buf, &wcm, ipv6Addr)
+				tracef("#p2p multicastResponse ipv6 write to %s: err %v(%d bytes)\n", v.Name, err, n)
+
 				if err == nil && n > 0 {
 					s.interfaces.GetByIndex(ifIndex).SetFlag(NetInterfaceScopeIPv6, NetInterfaceStateFlagMessageSent)
 				}
@@ -882,6 +956,8 @@ func (s *Server) multicastResponse(msg *dns.Msg, ifIndex int, requiredFlags ...N
 				if err == nil && n > 0 {
 					intf.SetFlag(NetInterfaceScopeIPv6, NetInterfaceStateFlagMessageSent)
 				}
+				tracef("#p2p multicastResponse ipv6 write to %s: err %v(%d bytes)\n", intf.Name, err, n)
+
 			}
 		}
 	}

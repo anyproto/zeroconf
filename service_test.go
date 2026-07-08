@@ -52,7 +52,7 @@ func TestBasic(t *testing.T) {
 	time.Sleep(time.Second)
 
 	entries := make(chan *ServiceEntry, 100)
-	if err := Browse(ctx, mdnsService, mdnsDomain, entries); err != nil {
+	if err := Browse(ctx, mdnsService, mdnsDomain, entries, SelectIPTraffic(IPv4)); err != nil {
 		t.Fatalf("Expected browse success, but got %v", err)
 	}
 	<-ctx.Done()

@@ -3,6 +3,8 @@ package zeroconf
 import (
 	"fmt"
 	"net"
+	"os"
+	"syscall"
 
 	"golang.org/x/net/ipv4"
 	"golang.org/x/net/ipv6"
@@ -35,6 +37,50 @@ var (
 	}
 )
 
+func createCustomUDPConn(localAddress *net.UDPAddr, interfaceIndex int) (*net.UDPConn, error) {
+	// Create socket
+	sock, err := syscall.Socket(syscall.AF_INET, syscall.SOCK_DGRAM, 0)
+	if err != nil {
+		return nil, fmt.Errorf("failed to create socket: %w", err)
+	}
+
+	// Set SO_REUSEPORT
+	if err := syscall.SetsockoptInt(sock, syscall.SOL_SOCKET, syscall.SO_REUSEPORT, 1); err != nil {
+		syscall.Close(sock)
+		return nil, fmt.Errorf("failed to set SO_REUSEPORT: %w", err)
+	}
+
+	// Set IP_BOUND_IF
+	if err := syscall.SetsockoptInt(sock, syscall.IPPROTO_IP, syscall.IP_BOUND_IF, interfaceIndex); err != nil {
+		syscall.Close(sock)
+		return nil, fmt.Errorf("failed to set IP_BOUND_IF: %w", err)
+	}
+
+	// Set SO_BROADCAST
+	if err := syscall.SetsockoptInt(sock, syscall.SOL_SOCKET, syscall.SO_BROADCAST, 1); err != nil {
+		syscall.Close(sock)
+		return nil, fmt.Errorf("failed to set SO_BROADCAST: %w", err)
+	}
+
+	// Bind
+	sockaddr := &syscall.SockaddrInet4{Port: localAddress.Port}
+	copy(sockaddr.Addr[:], localAddress.IP.To4())
+	if err := syscall.Bind(sock, sockaddr); err != nil {
+		syscall.Close(sock)
+		return nil, fmt.Errorf("failed to bind: %w", err)
+	}
+
+	// Convert the socket FD to a net.UDPConn
+	file := os.NewFile(uintptr(sock), "mdnsUDP")
+	udpConn, err := net.FilePacketConn(file)
+	file.Close()
+	if err != nil {
+		return nil, fmt.Errorf("failed to convert FD to UDPConn: %w", err)
+	}
+
+	return udpConn.(*net.UDPConn), nil
+}
+
 func joinUdp6Multicast(interfaces []*NetInterface) (*ipv6.PacketConn, error) {
 	if len(interfaces) == 0 {
 		return nil, fmt.Errorf("no interfaces to join multicast on")
@@ -53,6 +99,8 @@ func joinUdp6Multicast(interfaces []*NetInterface) (*ipv6.PacketConn, error) {
 	var anySucceeded bool
 	for _, iface := range interfaces {
 		if err := pkConn.JoinGroup(&iface.Interface, &net.UDPAddr{IP: mdnsGroupIPv6}); err == nil {
+			traceln("Joined IPv6 multicast on interface: ", iface.Name)
+
 			iface.SetFlag(NetInterfaceScopeIPv6, NetInterfaceStateFlagMulticastJoined)
 			anySucceeded = true
 		}
@@ -72,6 +120,7 @@ func joinUdp4Multicast(interfaces []*NetInterface) (*ipv4.PacketConn, error) {
 		return nil, fmt.Errorf("no interfaces to join multicast on")
 	}
 
+	//udpConn, err := createCustomUDPConn(mdnsWildcardAddrIPv4, 12)
 	udpConn, err := net.ListenUDP("udp4", mdnsWildcardAddrIPv4)
 	if err != nil {
 		// log.Printf("[ERR] bonjour: Failed to bind to udp4 mutlicast: %v", err)
@@ -87,6 +136,7 @@ func joinUdp4Multicast(interfaces []*NetInterface) (*ipv4.PacketConn, error) {
 
 	for _, iface := range interfaces {
 		if err := pkConn.JoinGroup(&iface.Interface, &net.UDPAddr{IP: mdnsGroupIPv4}); err == nil {
+			traceln("Joined IPv4 multicast on interface: ", iface.Name)
 			anySucceed = true
 			iface.SetFlag(NetInterfaceScopeIPv4, NetInterfaceStateFlagMulticastJoined)
 		}
