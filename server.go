@@ -284,6 +284,28 @@ func (s *Server) Shutdown() {
 	s.isShutdown = true
 }
 
+// The recv loops back off on ReadFrom errors so a persistent error (e.g. iOS
+// ENOTCONN after a network change: the socket is dead but neither closed nor
+// Shutdown, so ReadFrom returns instantly) can't busy-spin a core. Backoff grows
+// on each consecutive error and resets on the first successful read, so a genuine
+// transient recovers fast while a dead socket settles to one syscall every max.
+const (
+	recvErrBackoffMin = 50 * time.Millisecond
+	recvErrBackoffMax = 5 * time.Second
+)
+
+// nextRecvBackoff doubles the current backoff up to the cap; a zero (or sub-min)
+// input starts at the minimum.
+func nextRecvBackoff(cur time.Duration) time.Duration {
+	if cur < recvErrBackoffMin {
+		return recvErrBackoffMin
+	}
+	if cur *= 2; cur > recvErrBackoffMax {
+		return recvErrBackoffMax
+	}
+	return cur
+}
+
 // recv4 is a long running routine to receive packets from an interface
 func (s *Server) recv4(c *ipv4.PacketConn) {
 	defer s.refCount.Done()
@@ -291,6 +313,7 @@ func (s *Server) recv4(c *ipv4.PacketConn) {
 		return
 	}
 	buf := make([]byte, 65536)
+	var backoff time.Duration
 	for {
 		select {
 		case <-s.shouldShutdown:
@@ -299,8 +322,15 @@ func (s *Server) recv4(c *ipv4.PacketConn) {
 			var ifIndex int
 			n, cm, from, err := c.ReadFrom(buf)
 			if err != nil {
+				backoff = nextRecvBackoff(backoff)
+				select {
+				case <-s.shouldShutdown:
+					return
+				case <-time.After(backoff):
+				}
 				continue
 			}
+			backoff = 0
 			if cm != nil {
 				ifIndex = cm.IfIndex
 			}
@@ -316,6 +346,7 @@ func (s *Server) recv6(c *ipv6.PacketConn) {
 		return
 	}
 	buf := make([]byte, 65536)
+	var backoff time.Duration
 	for {
 		select {
 		case <-s.shouldShutdown:
@@ -324,8 +355,15 @@ func (s *Server) recv6(c *ipv6.PacketConn) {
 			var ifIndex int
 			n, cm, from, err := c.ReadFrom(buf)
 			if err != nil {
+				backoff = nextRecvBackoff(backoff)
+				select {
+				case <-s.shouldShutdown:
+					return
+				case <-time.After(backoff):
+				}
 				continue
 			}
+			backoff = 0
 			if cm != nil {
 				ifIndex = cm.IfIndex
 			}
