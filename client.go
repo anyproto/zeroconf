@@ -78,9 +78,12 @@ func ClientWriteTimeout(duration time.Duration) ClientOption {
 // Browse for all services of a given type in a given domain.
 // Received entries are sent on the entries channel.
 // It blocks until the context is canceled (or an error occurs).
+// The entries channel is closed on every return path, so consumers may safely
+// range over it.
 func Browse(ctx context.Context, service, domain string, entries chan<- *ServiceEntry, opts ...ClientOption) error {
 	cl, err := newClient(applyOpts(opts...))
 	if err != nil {
+		close(entries)
 		return err
 	}
 	params := defaultParams(service)
@@ -95,9 +98,12 @@ func Browse(ctx context.Context, service, domain string, entries chan<- *Service
 // Lookup a specific service by its name and type in a given domain.
 // Received entries are sent on the entries channel.
 // It blocks until the context is canceled (or an error occurs).
+// The entries channel is closed on every return path, so consumers may safely
+// range over it.
 func Lookup(ctx context.Context, instance, service, domain string, entries chan<- *ServiceEntry, opts ...ClientOption) error {
 	cl, err := newClient(applyOpts(opts...))
 	if err != nil {
+		close(entries)
 		return err
 	}
 	params := defaultParams(service)
