@@ -2,6 +2,7 @@ package zeroconf
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log"
 	"math/rand"
@@ -354,22 +355,37 @@ func (c *client) recv(ctx context.Context, l interface{}, msgCh chan *dns.Msg) {
 		return
 	}
 
+	recvLoop(ctx, readFrom, msgCh)
+}
+
+// recvLoop reads packets via readFrom, unpacks them into dns.Msg structures
+// and forwards them to msgCh until ctx is canceled or the connection is
+// closed. Transient read errors are retried with a growing backoff (see
+// nextRecvBackoff), mirroring the server recv loops: a persistently erroring
+// socket must neither busy-spin a core nor silently kill reception.
+func recvLoop(ctx context.Context, readFrom func([]byte) (n int, src net.Addr, err error), msgCh chan *dns.Msg) {
 	buf := make([]byte, 65536)
-	var fatalErr error
+	var backoff time.Duration
 	for {
-		// Handles the following cases:
-		// - ReadFrom aborts with error due to closed UDP connection -> causes ctx cancel
-		// - ReadFrom aborts otherwise.
-		// TODO: the context check can be removed. Verify!
-		if ctx.Err() != nil || fatalErr != nil {
+		if ctx.Err() != nil {
 			return
 		}
 
 		n, _, err := readFrom(buf)
 		if err != nil {
-			fatalErr = err
+			if errors.Is(err, net.ErrClosed) {
+				// The connection was closed (shutdown path): terminal.
+				return
+			}
+			backoff = nextRecvBackoff(backoff)
+			select {
+			case <-ctx.Done():
+				return
+			case <-time.After(backoff):
+			}
 			continue
 		}
+		backoff = 0
 		msg := new(dns.Msg)
 		if err := msg.Unpack(buf[:n]); err != nil {
 			// log.Printf("[WARN] mdns: Failed to unpack packet: %v", err)
