@@ -379,6 +379,9 @@ func (c *client) mainloop(ctx context.Context, params *lookupParams, msgCh <-cha
 				// address records without their service records in this
 				// packet belong to the instances already resolved to
 				// that target
+				for k, e := range entries {
+					byIface.fillTarget(k, e, now)
+				}
 				for _, answer := range sections {
 					var name string
 					switch rr := answer.(type) {

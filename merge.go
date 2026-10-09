@@ -24,6 +24,7 @@ type addrRecord struct {
 	ip    net.IP
 	zoned netip.Addr
 	exp   time.Time
+	seen  time.Time // when the record last arrived
 }
 
 // answerAddrs are the address records one message carried for one instance.
@@ -35,7 +36,7 @@ type answerAddrs struct {
 }
 
 func (a *answerAddrs) add(ip net.IP, ifIndex int, hdr dns.RR_Header, now time.Time) {
-	rec := addrRecord{ip: ip, exp: now.Add(time.Duration(hdr.Ttl) * time.Second)}
+	rec := addrRecord{ip: ip, exp: now.Add(time.Duration(hdr.Ttl) * time.Second), seen: now}
 	flush := hdr.Class&qClassCacheFlush != 0
 	if ip.To4() != nil {
 		a.v4 = append(a.v4, rec)
@@ -49,14 +50,22 @@ func (a *answerAddrs) add(ip net.IP, ifIndex int, hdr dns.RR_Header, now time.Ti
 	a.flush6 = a.flush6 || flush
 }
 
-// mergeRecords applies records to a link's family: a cache-flush set
-// replaces it; otherwise each record renews, adds or (TTL 0) withdraws its
-// own address and leaves the others.
-func mergeRecords(have, records []addrRecord, flush bool) []addrRecord {
-	if flush {
-		return slices.Clone(records)
-	}
+// mergeRecords applies records to a link's family. Each record renews, adds
+// or (TTL 0) withdraws its own address. A live record with the cache-flush
+// bit also says the sender's set is complete, so the link's other addresses
+// expire one second later, unless they arrived within the last second
+// themselves: a set split over several packets must survive (RFC 6762 10.2).
+func mergeRecords(have, records []addrRecord, flush bool, now time.Time) []addrRecord {
 	res := slices.Clone(have)
+	if flush && slices.ContainsFunc(records, func(r addrRecord) bool { return r.exp.After(now) }) {
+		deadline := now.Add(time.Second)
+		for i, h := range res {
+			listed := slices.ContainsFunc(records, func(r addrRecord) bool { return r.ip.Equal(h.ip) })
+			if !listed && now.Sub(h.seen) >= time.Second && h.exp.After(deadline) {
+				res[i].exp = deadline
+			}
+		}
+	}
 	for _, r := range records {
 		if i := slices.IndexFunc(res, func(h addrRecord) bool { return h.ip.Equal(r.ip) }); i >= 0 {
 			res[i] = r
@@ -123,8 +132,18 @@ func (m ifaceAddrs) update(key string, ifIndex int, fresh *ServiceEntry, addrs *
 		inst.nextOrder++
 		inst.links[ifIndex] = link
 	}
-	link.v4 = mergeRecords(link.v4, addrs.v4, addrs.flush4)
-	link.v6 = mergeRecords(link.v6, addrs.v6, addrs.flush6)
+	link.v4 = mergeRecords(link.v4, addrs.v4, addrs.flush4, now)
+	link.v6 = mergeRecords(link.v6, addrs.v6, addrs.flush6, now)
+}
+
+// fillTarget gives a partial entry of this packet (PTR or TXT without SRV)
+// the instance's resolved target, so its address records can be matched.
+func (m ifaceAddrs) fillTarget(key string, e *ServiceEntry, now time.Time) {
+	inst := m[key]
+	if e.HostName != "" || inst == nil || inst.port == 0 || !inst.expiry.After(now) {
+		return
+	}
+	e.HostName, e.Port = inst.host, inst.port
 }
 
 // template returns an entry for an instance whose target is hostName, to
@@ -141,7 +160,9 @@ func (m ifaceAddrs) template(key, hostName string, now time.Time) *ServiceEntry 
 	return &e
 }
 
-// prune drops expired records, empty links and instances with no link left.
+// prune drops expired records and empty links, and an instance with no link
+// left once its service records expired too (a split announcement resolves
+// the target before its addresses arrive).
 func (m ifaceAddrs) prune(now time.Time) {
 	live := func(r addrRecord) bool { return !r.exp.After(now) }
 	for key, inst := range m {
@@ -152,7 +173,7 @@ func (m ifaceAddrs) prune(now time.Time) {
 				delete(inst.links, i)
 			}
 		}
-		if len(inst.links) == 0 {
+		if len(inst.links) == 0 && !inst.expiry.After(now) {
 			delete(m, key)
 		}
 	}

@@ -446,17 +446,88 @@ func TestMainloopMergesAnswersFromSelectedLinks(t *testing.T) {
 		}
 	})
 
-	t.Run("a cache-flush answer on the same link replaces its addresses", func(t *testing.T) {
+	t.Run("a cache-flush answer retires the link's older addresses a second later", func(t *testing.T) {
 		// given
 		f := newMainloopFixture(t, cableClient(), true, 4)
 		f.send(f.answer(3600, "fe80::1"), ifCable)
 		f.next()
+		time.Sleep(1100 * time.Millisecond)
 
 		// when
+		f.send(flushed(f.answer(3600, "fe80::2")), ifCable)
+		f.next() // fe80::2 added; fe80::1 still live for a second
+		time.Sleep(1100 * time.Millisecond)
 		f.send(flushed(f.answer(3600, "fe80::2")), ifCable)
 
 		// then
 		if got, want := addrStrings(f.next()), []string{"fe80::2%if31"}; !reflect.DeepEqual(got, want) {
+			t.Errorf("got %v, want %v", got, want)
+		}
+	})
+
+	t.Run("a cache-flush set split over packets keeps every part", func(t *testing.T) {
+		// given
+		f := newMainloopFixture(t, cableClient(), true, 4)
+		f.send(f.answer(3600, "192.168.1.62"), ifWifi)
+		f.next()
+
+		// when: one burst, two packets
+		f.send(flushed(f.answer(3600, "fe80::62")), ifCable)
+		f.next()
+		f.send(flushed(f.answer(3600, "2001:db8::62")), ifCable)
+		time.Sleep(1100 * time.Millisecond)
+		f.send(f.answer(3600, "192.168.1.62"), ifWifi)
+
+		// then: no delivery dropped the link-local address
+		f.none()
+	})
+
+	t.Run("a cache-flush goodbye withdraws only its own address", func(t *testing.T) {
+		// given
+		f := newMainloopFixture(t, cableClient(), true, 4)
+		f.send(f.answer(3600, "fe80::62", "2001:db8::62"), ifCable)
+		f.next()
+		time.Sleep(1100 * time.Millisecond)
+
+		// when
+		f.send(flushed(f.answerTTL(3600, 0, "2001:db8::62")), ifCable)
+		time.Sleep(1100 * time.Millisecond)
+		f.send(f.answer(3600, "fe80::62"), ifCable)
+
+		// then: the usable list never changed
+		f.none()
+	})
+
+	t.Run("a cold split announcement resolves", func(t *testing.T) {
+		// given: PTR and SRV first, nothing known yet
+		f := newMainloopFixture(t, cableClient(), true, 4)
+		f.send(f.answer(3600), ifCable)
+
+		// when: the address in its own packet
+		bare := new(dns.Msg)
+		bare.Response = true
+		bare.Answer = []dns.RR{&dns.AAAA{Hdr: dns.RR_Header{Name: f.host, Rrtype: dns.TypeAAAA, Class: dns.ClassINET, Ttl: 120}, AAAA: net.ParseIP("fe80::62")}}
+		f.send(bare, ifCable)
+
+		// then
+		if got, want := addrStrings(f.next()), []string{"fe80::62%if31"}; !reflect.DeepEqual(got, want) {
+			t.Errorf("got %v, want %v", got, want)
+		}
+	})
+
+	t.Run("an address beside a PTR without SRV reaches the entry", func(t *testing.T) {
+		// given
+		f := newMainloopFixture(t, cableClient(), true, 4)
+		f.send(f.answer(3600, "192.168.1.62"), ifWifi)
+		f.next()
+
+		// when
+		msg := f.answer(3600, "fe80::62")
+		msg.Extra = msg.Extra[1:] // drop the SRV
+		f.send(msg, ifCable)
+
+		// then
+		if got, want := addrStrings(f.next()), []string{"192.168.1.62", "fe80::62%if31"}; !reflect.DeepEqual(got, want) {
 			t.Errorf("got %v, want %v", got, want)
 		}
 	})
