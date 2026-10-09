@@ -1,12 +1,14 @@
 package zeroconf
 
 import (
+	"errors"
 	"fmt"
 	"log"
 	"math/rand"
 	"net"
 	"os"
 	"runtime"
+	"slices"
 	"strings"
 	"sync"
 	"time"
@@ -31,6 +33,7 @@ type serverOpts struct {
 	listenOn        IPType
 	writeTimeout    time.Duration
 	linkLocalIfaces map[int]struct{}
+	ipv6Ifaces      map[int]struct{}
 }
 
 func applyServerOpts(options ...ServerOption) serverOpts {
@@ -79,10 +82,15 @@ func ServerSelectIPTraffic(t IPType) ServerOption {
 // through its own link, so it is never announced on another interface.
 func ServerLinkLocalIPv6(ifIndexes ...int) ServerOption {
 	return func(o *serverOpts) {
-		o.linkLocalIfaces = make(map[int]struct{}, len(ifIndexes))
-		for _, i := range ifIndexes {
-			o.linkLocalIfaces[i] = struct{}{}
-		}
+		o.linkLocalIfaces = indexSet(ifIndexes)
+	}
+}
+
+// ServerSelectIPv6Ifaces limits IPv6 traffic to the interfaces with these
+// indexes: IPv4 keeps using every interface the server registered on.
+func ServerSelectIPv6Ifaces(ifIndexes ...int) ServerOption {
+	return func(o *serverOpts) {
+		o.ipv6Ifaces = indexSet(ifIndexes)
 	}
 }
 
@@ -236,7 +244,7 @@ func newServer(ifaces []net.Interface, opts serverOpts) (*Server, error) {
 	}
 
 	if (opts.listenOn & IPv6) > 0 {
-		s.ipv6conn, err = joinUdp6Multicast(ifaceList)
+		s.ipv6conn, err = joinUdp6Multicast(ifaceList, opts.ipv6Ifaces)
 		if err != nil {
 			log.Printf("[zeroconf] no suitable IPv6 interface: %s", err.Error())
 		}
@@ -731,28 +739,42 @@ func (s *Server) announceText() {
 }
 
 func (s *Server) unregister() error {
-	resp := new(dns.Msg)
-	resp.MsgHdr.Response = true
-	resp.Answer = []dns.RR{}
-	resp.Extra = []dns.RR{}
-	s.composeLookupAnswers(resp, 0, 0, true)
-	// cleanup ifaces we have NEVER written successfully. No need to unregister them
-
-	return s.multicastResponse(resp, 0, NetInterfaceStateFlagMulticastJoined, NetInterfaceStateFlagMessageSent)
+	// one goodbye per interface: an interface may have announced its own
+	// addresses (see ServerLinkLocalIPv6), and each record needs its goodbye
+	var errs []error
+	for _, intf := range s.interfaces {
+		resp := new(dns.Msg)
+		resp.MsgHdr.Response = true
+		resp.Answer = []dns.RR{}
+		resp.Extra = []dns.RR{}
+		s.composeLookupAnswers(resp, 0, intf.Index, true)
+		// cleanup ifaces we have NEVER written successfully. No need to unregister them
+		if err := s.multicastResponse(resp, intf.Index, NetInterfaceStateFlagMulticastJoined, NetInterfaceStateFlagMessageSent); err != nil {
+			errs = append(errs, err)
+		}
+	}
+	return errors.Join(errs...)
 }
 
 func (s *Server) appendAddrs(list []dns.RR, ttl uint32, ifIndex int, flushCache bool) []dns.RR {
-	v4 := s.service.AddrIPv4
-	v6 := s.service.AddrIPv6
+	_, linkLocal := s.linkLocalIfaces[ifIndex]
+	linkLocal = linkLocal && ifIndex != 0
+	// clipped: appends below must copy, not write into the shared service
+	// entry, which concurrent answers on other interfaces read
+	v4 := slices.Clip(s.service.AddrIPv4)
+	v6 := slices.Clip(s.service.AddrIPv6)
 	if len(v4) == 0 && len(v6) == 0 {
 		iface, _ := net.InterfaceByIndex(ifIndex)
 		if iface != nil {
 			a4, a6 := addrsForInterface(iface)
 			v4 = append(v4, a4...)
-			v6 = append(v6, a6...)
+			if !linkLocal {
+				// a link-local interface announces its link-local only
+				v6 = append(v6, a6...)
+			}
 		}
 	}
-	if _, ok := s.linkLocalIfaces[ifIndex]; ok && ifIndex != 0 {
+	if linkLocal {
 		v6 = appendLinkLocal(v6, ifIndex)
 	}
 	if ttl > 0 {
@@ -940,6 +962,8 @@ func (s *Server) multicastResponse(msg *dns.Msg, ifIndex int, requiredFlags ...N
 		// See https://pkg.go.dev/golang.org/x/net/ipv6#pkg-note-BUG
 		// As of Golang 1.18.4
 		// On Windows, the ControlMessage for ReadFrom and WriteTo methods of PacketConn is not implemented.
+		// IPv6 goes only where the group was joined (see ServerSelectIPv6Ifaces)
+		requiredFlags := append([]NetInterfaceStateFlag{NetInterfaceStateFlagMulticastJoined}, requiredFlags...)
 		var wcm ipv6.ControlMessage
 		if ifIndex != 0 {
 			if v := s.interfaces.GetByIndex(ifIndex); v != nil && v.HasFlags(NetInterfaceScopeIPv6, requiredFlags...) {

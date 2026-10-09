@@ -35,7 +35,18 @@ var (
 	}
 )
 
-func joinUdp6Multicast(interfaces []*NetInterface) (*ipv6.PacketConn, error) {
+// joinUdp6Multicast joins the IPv6 group on interfaces, or only on those
+// whose index is in only when it is non-nil.
+func joinUdp6Multicast(interfaces []*NetInterface, only map[int]struct{}) (*ipv6.PacketConn, error) {
+	if only != nil {
+		var selected []*NetInterface
+		for _, iface := range interfaces {
+			if _, ok := only[iface.Index]; ok {
+				selected = append(selected, iface)
+			}
+		}
+		interfaces = selected
+	}
 	if len(interfaces) == 0 {
 		return nil, fmt.Errorf("no interfaces to join multicast on")
 	}

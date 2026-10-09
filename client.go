@@ -9,6 +9,7 @@ import (
 	"net"
 	"net/netip"
 	"runtime"
+	"slices"
 	"strconv"
 	"strings"
 	"time"
@@ -47,6 +48,7 @@ type client struct {
 type clientOpts struct {
 	listenOn     IPType
 	ifaces       []net.Interface
+	ipv6Ifaces   map[int]struct{}
 	writeTimeout time.Duration
 }
 
@@ -69,6 +71,22 @@ func SelectIfaces(ifaces []net.Interface) ClientOption {
 	return func(o *clientOpts) {
 		o.ifaces = ifaces
 	}
+}
+
+// SelectIPv6Ifaces limits IPv6 traffic to the interfaces with these indexes,
+// out of those selected by SelectIfaces: IPv4 keeps using all of them.
+func SelectIPv6Ifaces(ifIndexes ...int) ClientOption {
+	return func(o *clientOpts) {
+		o.ipv6Ifaces = indexSet(ifIndexes)
+	}
+}
+
+func indexSet(ifIndexes []int) map[int]struct{} {
+	set := make(map[int]struct{}, len(ifIndexes))
+	for _, i := range ifIndexes {
+		set[i] = struct{}{}
+	}
+	return set
 }
 
 // ClientWriteTimeout sets timeout for writing to the socket
@@ -179,7 +197,7 @@ func newClient(opts clientOpts) (*client, error) {
 	// IPv6 interfaces
 	var ipv6conn *ipv6.PacketConn
 	if (opts.listenOn & IPv6) > 0 {
-		ipv6conn, err6 = joinUdp6Multicast(ifaceList)
+		ipv6conn, err6 = joinUdp6Multicast(ifaceList, opts.ipv6Ifaces)
 	}
 	if ipv4conn == nil && ipv6conn == nil {
 		return nil, errors.Join(err4, err6)
@@ -337,8 +355,15 @@ func (c *client) mainloop(ctx context.Context, params *lookupParams, msgCh <-cha
 					delete(sentEntries, k)
 					continue
 				}
-				if _, ok := sentEntries[k]; ok {
-					continue
+				if sent, ok := sentEntries[k]; ok {
+					// an answer on another interface may add addresses
+					// (a link-local one over a cable, IPv4 over Wi-Fi):
+					// deliver the union, once per change
+					merged, changed := mergeEntryAddrs(sent, e)
+					if !changed {
+						continue
+					}
+					e = merged
 				}
 
 				// If this is an DNS-SD query do not throw PTR away.
@@ -353,14 +378,54 @@ func (c *client) mainloop(ctx context.Context, params *lookupParams, msgCh <-cha
 				// Submit entry to subscriber and cache it.
 				// This is also a point to possibly stop probing actively for a
 				// service entry.
+				// the subscriber owns e once sent and may reorder its
+				// slices: keep a private copy to merge later answers into
+				sentEntries[k] = e.cloneAddrs()
 				params.Entries <- e
-				sentEntries[k] = e
 				if !params.isBrowsing {
 					params.disableProbing()
 				}
 			}
 		}
 	}
+}
+
+// mergeEntryAddrs returns fresh with the addresses of an already delivered
+// entry in front, and whether fresh added any. Neither entry is modified: the
+// subscriber may still hold sent.
+func mergeEntryAddrs(sent, fresh *ServiceEntry) (*ServiceEntry, bool) {
+	merged := *fresh
+	var changed bool
+	merged.AddrIPv4, changed = unionIPs(sent.AddrIPv4, fresh.AddrIPv4, changed)
+	merged.AddrIPv6, changed = unionIPs(sent.AddrIPv6, fresh.AddrIPv6, changed)
+	merged.AddrIPv6Zoned = slices.Clone(sent.AddrIPv6Zoned)
+	for _, a := range fresh.AddrIPv6Zoned {
+		if !slices.Contains(merged.AddrIPv6Zoned, a) {
+			merged.AddrIPv6Zoned = append(merged.AddrIPv6Zoned, a)
+			changed = true
+		}
+	}
+	return &merged, changed
+}
+
+// cloneAddrs copies the entry with its own address slices.
+func (e *ServiceEntry) cloneAddrs() *ServiceEntry {
+	c := *e
+	c.AddrIPv4 = slices.Clone(e.AddrIPv4)
+	c.AddrIPv6 = slices.Clone(e.AddrIPv6)
+	c.AddrIPv6Zoned = slices.Clone(e.AddrIPv6Zoned)
+	return &c
+}
+
+func unionIPs(sent, fresh []net.IP, changed bool) ([]net.IP, bool) {
+	res := slices.Clone(sent)
+	for _, ip := range fresh {
+		if !slices.ContainsFunc(res, ip.Equal) {
+			res = append(res, ip)
+			changed = true
+		}
+	}
+	return res, changed
 }
 
 // Shutdown client will close currently open connections and channel implicitly.
