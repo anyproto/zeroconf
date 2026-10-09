@@ -279,7 +279,8 @@ func (c *client) mainloop(ctx context.Context, params *lookupParams, msgCh <-cha
 	for {
 		var (
 			now     time.Time
-			ifIndex int // interface the current message arrived on
+			ifIndex int                     // interface the current message arrived on
+			records map[string]*answerAddrs // its address records per instance
 		)
 		select {
 		case <-ctx.Done():
@@ -291,10 +292,12 @@ func (c *client) mainloop(ctx context.Context, params *lookupParams, msgCh <-cha
 			for k, e := range sentEntries {
 				if t.After(e.Expiry) {
 					delete(sentEntries, k)
-					delete(byIface, k)
 					delete(sentKeys, k)
 				}
 			}
+			// address records expire on their own TTLs, not on the
+			// last delivery's
+			byIface.prune(t)
 			continue
 		case received := <-msgCh:
 			msg := received.msg
@@ -352,21 +355,30 @@ func (c *client) mainloop(ctx context.Context, params *lookupParams, msgCh <-cha
 				}
 			}
 			// Associate IPs in a second round as other fields should be filled by now.
+			records = make(map[string]*answerAddrs)
+			addRecord := func(k string, ip net.IP, ttl uint32) {
+				if records[k] == nil {
+					records[k] = &answerAddrs{}
+				}
+				records[k].add(ip, ifIndex, ttl, now)
+			}
 			for _, answer := range sections {
 				switch rr := answer.(type) {
 				case *dns.A:
 					for k, e := range entries {
 						if e.HostName == rr.Hdr.Name {
 							entries[k].AddrIPv4 = append(entries[k].AddrIPv4, rr.A)
+							addRecord(k, rr.A, rr.Hdr.Ttl)
 						}
 					}
 				case *dns.AAAA:
 					for k, e := range entries {
 						if e.HostName == rr.Hdr.Name {
 							entries[k].AddrIPv6 = append(entries[k].AddrIPv6, rr.AAAA)
-							if zoned, ok := zonedIPv6(rr.AAAA, received.ifIndex); ok {
+							if zoned, ok := zonedIPv6(rr.AAAA, ifIndex); ok {
 								entries[k].AddrIPv6Zoned = append(entries[k].AddrIPv6Zoned, zoned)
 							}
+							addRecord(k, rr.AAAA, rr.Hdr.Ttl)
 						}
 					}
 				}
@@ -375,20 +387,29 @@ func (c *client) mainloop(ctx context.Context, params *lookupParams, msgCh <-cha
 
 		if len(entries) > 0 {
 			for k, e := range entries {
-				if !e.Expiry.After(now) {
-					delete(entries, k)
-					delete(sentEntries, k)
-					delete(byIface, k)
-					delete(sentKeys, k)
-					continue
-				}
 				var key string
 				if merging {
-					byIface.update(k, ifIndex, e)
-					e, key = byIface.entry(k, e, now, c.ipv6Ifaces)
-				}
-				if _, ok := sentEntries[k]; ok {
-					if !merging || key == sentKeys[k] {
+					byIface.update(k, ifIndex, e, records[k], now)
+					merged, mergedKey, ok := byIface.entry(k, e, now, c.ipv6Ifaces)
+					if !ok {
+						if !e.Expiry.After(now) {
+							// a goodbye on the last link
+							delete(sentEntries, k)
+							delete(sentKeys, k)
+						}
+						continue
+					}
+					if _, sent := sentEntries[k]; sent && mergedKey == sentKeys[k] {
+						continue
+					}
+					e, key = merged, mergedKey
+				} else {
+					if !e.Expiry.After(now) {
+						delete(entries, k)
+						delete(sentEntries, k)
+						continue
+					}
+					if _, ok := sentEntries[k]; ok {
 						continue
 					}
 				}

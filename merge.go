@@ -4,95 +4,165 @@ import (
 	"net"
 	"net/netip"
 	"slices"
+	"strconv"
 	"strings"
 	"time"
 )
 
 // A browser selected IPv6 interfaces (SelectIPv6Ifaces) for a link that has
 // no IPv4, so one peer may answer on several links: IPv4 over Wi-Fi, IPv6
-// link-local over a cable. ifaceAddrs keeps each link's latest addresses so a
-// later answer can extend an entry that was already delivered. Without
+// link-local over a cable. ifaceAddrs keeps what each link last said so a
+// later answer can change an entry that was already delivered. Without
 // selected interfaces the first answer is final, as it always was.
 
-// linkAddrs is what one interface last told us about one service instance,
-// per family. A newer answer on the same interface replaces a family it
-// carries, so an address the peer dropped goes with it; each family expires
-// on its own, so an answer on another link never renews it.
+// addrRecord is one A or AAAA record, live until exp (its own TTL; a goodbye
+// with TTL 0 is never live). zoned is set for an AAAA record when it can be
+// dialed (see zonedIPv6).
+type addrRecord struct {
+	ip    net.IP
+	zoned netip.Addr
+	exp   time.Time
+}
+
+// answerAddrs are the address records one message carried for one instance.
+type answerAddrs struct {
+	v4, v6 []addrRecord
+}
+
+func (a *answerAddrs) add(ip net.IP, ifIndex int, ttl uint32, now time.Time) {
+	rec := addrRecord{ip: ip, exp: now.Add(time.Duration(ttl) * time.Second)}
+	if ip.To4() != nil {
+		a.v4 = append(a.v4, rec)
+		return
+	}
+	if zoned, ok := zonedIPv6(ip, ifIndex); ok {
+		rec.zoned = zoned
+	}
+	a.v6 = append(a.v6, rec)
+}
+
+// linkAddrs is what one interface last told us about one instance, per
+// family: an answer carrying a family replaces it (cache-flush style), so an
+// address the peer dropped goes with it, and an answer on another link never
+// renews it.
 type linkAddrs struct {
-	v4, v6     []net.IP
-	zoned      []netip.Addr
-	v4Exp      time.Time
-	v6Exp      time.Time
-	firstOrder int
+	v4, v6 []addrRecord
+	order  int
 }
 
-// ifaceAddrs maps instance -> interface index -> addresses.
-type ifaceAddrs map[string]map[int]*linkAddrs
+// instanceAddrs is one instance across links, with the last resolved
+// service target: a partial answer (PTR or TXT only) keeps the known one.
+type instanceAddrs struct {
+	links     map[int]*linkAddrs
+	nextOrder int
+	host      string
+	port      int
+	text      []string
+	expiry    time.Time
+}
 
-// update records the addresses of fresh, received on ifIndex.
-func (m ifaceAddrs) update(key string, ifIndex int, fresh *ServiceEntry) {
-	links := m[key]
-	if links == nil {
-		links = map[int]*linkAddrs{}
-		m[key] = links
+type ifaceAddrs map[string]*instanceAddrs
+
+// update records fresh, received on ifIndex with the address records addrs.
+// A service goodbye (fresh expired) withdraws this link only.
+func (m ifaceAddrs) update(key string, ifIndex int, fresh *ServiceEntry, addrs *answerAddrs, now time.Time) {
+	inst := m[key]
+	if inst == nil {
+		inst = &instanceAddrs{links: map[int]*linkAddrs{}}
+		m[key] = inst
 	}
-	link := links[ifIndex]
+	if !fresh.Expiry.After(now) {
+		delete(inst.links, ifIndex)
+		return
+	}
+	inst.expiry = fresh.Expiry
+	if fresh.Port != 0 && fresh.HostName != "" {
+		inst.host, inst.port = fresh.HostName, fresh.Port
+	}
+	if fresh.Text != nil {
+		inst.text = fresh.Text
+	}
+	if addrs == nil {
+		return
+	}
+	link := inst.links[ifIndex]
 	if link == nil {
-		link = &linkAddrs{firstOrder: len(links)}
-		links[ifIndex] = link
+		link = &linkAddrs{order: inst.nextOrder}
+		inst.nextOrder++
+		inst.links[ifIndex] = link
 	}
-	if len(fresh.AddrIPv4) > 0 {
-		link.v4, link.v4Exp = slices.Clone(fresh.AddrIPv4), fresh.Expiry
+	if len(addrs.v4) > 0 {
+		link.v4 = addrs.v4
 	}
-	if len(fresh.AddrIPv6) > 0 {
-		link.v6, link.zoned, link.v6Exp = slices.Clone(fresh.AddrIPv6), slices.Clone(fresh.AddrIPv6Zoned), fresh.Expiry
+	if len(addrs.v6) > 0 {
+		link.v6 = addrs.v6
 	}
 }
 
-// entry returns fresh carrying the live addresses of every interface, in the
-// order the interfaces first answered, and the key that decides whether a
-// delivery is due: the IPv4 addresses and the link-local addresses received
-// on a selected interface (selected), the only ones a caller can use beyond
-// the first answer.
-func (m ifaceAddrs) entry(key string, fresh *ServiceEntry, now time.Time, selected map[int]struct{}) (*ServiceEntry, string) {
-	links := m[key]
-	indexes := make([]int, 0, len(links))
-	for i := range links {
+// prune drops expired records, empty links and instances with no link left.
+func (m ifaceAddrs) prune(now time.Time) {
+	live := func(r addrRecord) bool { return !r.exp.After(now) }
+	for key, inst := range m {
+		for i, link := range inst.links {
+			link.v4 = slices.DeleteFunc(link.v4, live)
+			link.v6 = slices.DeleteFunc(link.v6, live)
+			if len(link.v4) == 0 && len(link.v6) == 0 {
+				delete(inst.links, i)
+			}
+		}
+		if len(inst.links) == 0 {
+			delete(m, key)
+		}
+	}
+}
+
+// entry returns the instance as one entry: the last resolved target with the
+// live addresses of every link, in the order the links first answered. ok is
+// false while there is nothing to deliver (no resolved target, no address).
+// The key decides whether a delivery is due: the target, the IPv4 addresses
+// and the link-local addresses received on a selected interface (selected),
+// the only ones a caller can use beyond the first answer.
+func (m ifaceAddrs) entry(key string, fresh *ServiceEntry, now time.Time, selected map[int]struct{}) (merged *ServiceEntry, deliveryKey string, ok bool) {
+	m.prune(now)
+	inst := m[key]
+	if inst == nil || inst.port == 0 {
+		return nil, "", false
+	}
+	indexes := make([]int, 0, len(inst.links))
+	for i := range inst.links {
 		indexes = append(indexes, i)
 	}
-	slices.SortFunc(indexes, func(a, b int) int { return links[a].firstOrder - links[b].firstOrder })
+	slices.SortFunc(indexes, func(a, b int) int { return inst.links[a].order - inst.links[b].order })
 
-	merged := *fresh
-	merged.AddrIPv4, merged.AddrIPv6, merged.AddrIPv6Zoned = nil, nil, nil
+	e := *fresh
+	e.HostName, e.Port, e.Text, e.Expiry = inst.host, inst.port, inst.text, inst.expiry
+	e.AddrIPv4, e.AddrIPv6, e.AddrIPv6Zoned = nil, nil, nil
 	var usable []string
 	for _, i := range indexes {
-		link := links[i]
-		if link.v4Exp.After(now) {
-			for _, ip := range link.v4 {
-				if !slices.ContainsFunc(merged.AddrIPv4, ip.Equal) {
-					merged.AddrIPv4 = append(merged.AddrIPv4, ip)
-					usable = append(usable, ip.String())
-				}
+		link := inst.links[i]
+		for _, r := range link.v4 {
+			if !slices.ContainsFunc(e.AddrIPv4, r.ip.Equal) {
+				e.AddrIPv4 = append(e.AddrIPv4, r.ip)
+				usable = append(usable, r.ip.String())
 			}
 		}
-		if link.v6Exp.After(now) {
-			for _, ip := range link.v6 {
-				if !slices.ContainsFunc(merged.AddrIPv6, ip.Equal) {
-					merged.AddrIPv6 = append(merged.AddrIPv6, ip)
-				}
+		_, sel := selected[i]
+		for _, r := range link.v6 {
+			if !slices.ContainsFunc(e.AddrIPv6, r.ip.Equal) {
+				e.AddrIPv6 = append(e.AddrIPv6, r.ip)
 			}
-			_, sel := selected[i]
-			for _, a := range link.zoned {
-				if slices.Contains(merged.AddrIPv6Zoned, a) {
-					continue
-				}
-				merged.AddrIPv6Zoned = append(merged.AddrIPv6Zoned, a)
-				if sel && a.Zone() != "" {
-					usable = append(usable, a.String())
-				}
+			if !r.zoned.IsValid() || slices.Contains(e.AddrIPv6Zoned, r.zoned) {
+				continue
+			}
+			e.AddrIPv6Zoned = append(e.AddrIPv6Zoned, r.zoned)
+			if sel && r.zoned.Zone() != "" {
+				usable = append(usable, r.zoned.String())
 			}
 		}
 	}
+	if len(e.AddrIPv4) == 0 && len(e.AddrIPv6) == 0 {
+		return nil, "", false
+	}
 	slices.Sort(usable)
-	return &merged, strings.Join(usable, ",")
+	return &e, inst.host + ":" + strconv.Itoa(inst.port) + "|" + strings.Join(usable, ","), true
 }

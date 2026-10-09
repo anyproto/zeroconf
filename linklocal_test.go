@@ -255,8 +255,13 @@ func newMainloopFixture(t *testing.T, cl *client, browsing bool, entriesBuf int)
 	return f
 }
 
-// answer is a service answer with a service TTL and the given address records.
+// answer is a service answer with a service TTL and the given address
+// records (TTL 120, as the server sends them).
 func (f *mainloopFixture) answer(ttl uint32, addrs ...string) *dns.Msg {
+	return f.answerTTL(ttl, 120, addrs...)
+}
+
+func (f *mainloopFixture) answerTTL(ttl, addrTTL uint32, addrs ...string) *dns.Msg {
 	msg := new(dns.Msg)
 	msg.Response = true
 	msg.Answer = []dns.RR{&dns.PTR{Hdr: dns.RR_Header{Name: f.params.ServiceName(), Rrtype: dns.TypePTR, Class: dns.ClassINET, Ttl: ttl}, Ptr: f.instance}}
@@ -264,9 +269,9 @@ func (f *mainloopFixture) answer(ttl uint32, addrs ...string) *dns.Msg {
 	for _, a := range addrs {
 		ip := net.ParseIP(a)
 		if ip.To4() != nil {
-			msg.Extra = append(msg.Extra, &dns.A{Hdr: dns.RR_Header{Name: f.host, Rrtype: dns.TypeA, Class: dns.ClassINET, Ttl: 120}, A: ip})
+			msg.Extra = append(msg.Extra, &dns.A{Hdr: dns.RR_Header{Name: f.host, Rrtype: dns.TypeA, Class: dns.ClassINET, Ttl: addrTTL}, A: ip})
 		} else {
-			msg.Extra = append(msg.Extra, &dns.AAAA{Hdr: dns.RR_Header{Name: f.host, Rrtype: dns.TypeAAAA, Class: dns.ClassINET, Ttl: 120}, AAAA: ip})
+			msg.Extra = append(msg.Extra, &dns.AAAA{Hdr: dns.RR_Header{Name: f.host, Rrtype: dns.TypeAAAA, Class: dns.ClassINET, Ttl: addrTTL}, AAAA: ip})
 		}
 	}
 	return msg
@@ -335,18 +340,98 @@ func TestMainloopMergesAnswersFromSelectedLinks(t *testing.T) {
 	})
 
 	t.Run("an answer on one link does not renew another link's addresses", func(t *testing.T) {
-		// given: Wi-Fi answered with a 1 s TTL
+		// given: Wi-Fi answered with a 1 s address TTL (service TTL 3600)
 		f := newMainloopFixture(t, cableClient(), true, 4)
-		f.send(f.answer(1, "192.168.1.62"), ifWifi)
+		f.send(f.answerTTL(3600, 1, "192.168.1.62"), ifWifi)
 		f.next()
 		time.Sleep(1100 * time.Millisecond)
 
-		// when: the cable answers after the Wi-Fi answer expired
+		// when: the cable answers after the Wi-Fi address expired
 		f.send(f.answer(3600, "fe80::62"), ifCable)
 
 		// then
-		if want := []string{"fe80::62%if31"}; !reflect.DeepEqual(addrStrings(f.next()), want) {
-			t.Errorf("want the cable address only")
+		if got, want := addrStrings(f.next()), []string{"fe80::62%if31"}; !reflect.DeepEqual(got, want) {
+			t.Errorf("got %v, want %v", got, want)
+		}
+	})
+
+	t.Run("a renewed link survives the cleanup of the delivery it came after", func(t *testing.T) {
+		// given: both links, the cable renewed later with a long address TTL
+		origCleanup := cleanupFreq
+		cleanupFreq = 200 * time.Millisecond
+		t.Cleanup(func() { cleanupFreq = origCleanup })
+		f := newMainloopFixture(t, cableClient(), true, 4)
+		f.send(f.answerTTL(1, 120, "192.168.1.62"), ifWifi)
+		f.next()
+		f.send(f.answerTTL(1, 120, "fe80::62"), ifCable)
+		f.next()
+		f.send(f.answerTTL(3600, 120, "fe80::62"), ifCable)
+		time.Sleep(1500 * time.Millisecond) // past expiry plus a cleanup tick
+
+		// when: Wi-Fi answers again after the deliveries expired
+		f.send(f.answer(3600, "192.168.1.62"), ifWifi)
+
+		// then: redelivered (its delivery expired) with the cable still in
+		if got, want := addrStrings(f.next()), []string{"192.168.1.62", "fe80::62%if31"}; !reflect.DeepEqual(got, want) {
+			t.Errorf("got %v, want %v", got, want)
+		}
+	})
+
+	t.Run("a partial answer never delivers an unresolved target", func(t *testing.T) {
+		// given
+		f := newMainloopFixture(t, cableClient(), true, 4)
+		f.send(f.answerTTL(3600, 1, "192.168.1.62"), ifWifi)
+		f.next()
+		f.send(f.answer(3600, "fe80::62"), ifCable)
+		f.next()
+		time.Sleep(1100 * time.Millisecond)
+
+		// when: a PTR-only answer after the Wi-Fi address expired
+		ptrOnly := f.answer(3600)
+		ptrOnly.Extra = nil
+		f.send(ptrOnly, ifWifi)
+
+		// then: the known target is kept with the live cable address
+		e := f.next()
+		if e.Port != 4006 || e.HostName != f.host {
+			t.Errorf("target = %s:%d, want %s:4006", e.HostName, e.Port, f.host)
+		}
+		if got, want := addrStrings(e), []string{"fe80::62%if31"}; !reflect.DeepEqual(got, want) {
+			t.Errorf("got %v, want %v", got, want)
+		}
+	})
+
+	t.Run("a goodbye on one link keeps the other link", func(t *testing.T) {
+		// given
+		f := newMainloopFixture(t, cableClient(), true, 4)
+		f.send(f.answer(3600, "192.168.1.62"), ifWifi)
+		f.next()
+		f.send(f.answer(3600, "fe80::62"), ifCable)
+		f.next()
+
+		// when: the peer leaves Wi-Fi
+		f.send(f.answerTTL(0, 0, "192.168.1.62"), ifWifi)
+
+		// then
+		if got, want := addrStrings(f.next()), []string{"fe80::62%if31"}; !reflect.DeepEqual(got, want) {
+			t.Errorf("got %v, want %v", got, want)
+		}
+	})
+
+	t.Run("a new port is delivered", func(t *testing.T) {
+		// given
+		f := newMainloopFixture(t, cableClient(), true, 4)
+		f.send(f.answer(3600, "192.168.1.62"), ifWifi)
+		f.next()
+
+		// when
+		moved := f.answer(3600, "192.168.1.62")
+		moved.Extra[0].(*dns.SRV).Port = 4007
+		f.send(moved, ifWifi)
+
+		// then
+		if e := f.next(); e.Port != 4007 {
+			t.Errorf("port = %d, want 4007", e.Port)
 		}
 	})
 
