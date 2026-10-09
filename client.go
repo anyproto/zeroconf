@@ -311,6 +311,14 @@ func (c *client) mainloop(ctx context.Context, params *lookupParams, msgCh <-cha
 			// address records expire on their own TTLs, not on the
 			// last delivery's
 			byIface.prune(t)
+			// an instance whose addresses all expired may come back
+			// unchanged: forget its delivery so that is delivered again
+			for k := range sentKeys {
+				if !byIface.deliverable(k, t) {
+					delete(sentEntries, k)
+					delete(sentKeys, k)
+				}
+			}
 			continue
 		case received := <-msgCh:
 			msg := received.msg
@@ -399,7 +407,7 @@ func (c *client) mainloop(ctx context.Context, params *lookupParams, msgCh <-cha
 						if _, ok := entries[k]; ok {
 							continue
 						}
-						if tmpl := byIface.template(k, name, now); tmpl != nil {
+						if tmpl := byIface.template(k, name, ifIndex, now); tmpl != nil {
 							entries[k] = tmpl
 						}
 					}
@@ -432,14 +440,19 @@ func (c *client) mainloop(ctx context.Context, params *lookupParams, msgCh <-cha
 			for k, e := range entries {
 				var key string
 				if merging {
+					if _, sent := sentKeys[k]; sent && !byIface.deliverable(k, now) {
+						// everything delivered before expired (the cleanup
+						// tick may not have run yet): a peer coming back
+						// unchanged is news
+						delete(sentEntries, k)
+						delete(sentKeys, k)
+					}
 					byIface.update(k, ifIndex, e, records[k], now)
 					merged, mergedKey, ok := byIface.entry(k, e, now, c.ipv6Ifaces)
 					if !ok {
-						if !e.Expiry.After(now) {
-							// a goodbye on the last link
-							delete(sentEntries, k)
-							delete(sentKeys, k)
-						}
+						// nothing deliverable (a goodbye on the last link)
+						delete(sentEntries, k)
+						delete(sentKeys, k)
 						continue
 					}
 					if _, sent := sentEntries[k]; sent && mergedKey == sentKeys[k] {

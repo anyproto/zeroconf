@@ -517,6 +517,62 @@ func TestMainloopMergesAnswersFromSelectedLinks(t *testing.T) {
 		f.none()
 	})
 
+	t.Run("an address alone does not revive a link its service left", func(t *testing.T) {
+		// given: on both links, then a goodbye on the cable only
+		f := newMainloopFixture(t, cableClient(), true, 4)
+		f.send(f.answer(3600, "192.168.1.62"), ifWifi)
+		f.next()
+		f.send(f.answer(3600, "fe80::62"), ifCable)
+		f.next()
+		goodbye := f.answer(0)
+		goodbye.Extra = goodbye.Extra[:1]
+		f.send(goodbye, ifCable)
+		f.next() // Wi-Fi only
+
+		// when: a bare AAAA on the cable (the host's other services)
+		bare := new(dns.Msg)
+		bare.Response = true
+		bare.Answer = []dns.RR{&dns.AAAA{Hdr: dns.RR_Header{Name: f.host, Rrtype: dns.TypeAAAA, Class: dns.ClassINET, Ttl: 120}, AAAA: net.ParseIP("fe80::62")}}
+		f.send(bare, ifCable)
+
+		// then
+		f.none()
+	})
+
+	t.Run("a peer whose addresses expired is delivered again when it returns", func(t *testing.T) {
+		// given: delivered, then its 1 s address expired (service TTL 3600)
+		f := newMainloopFixture(t, cableClient(), true, 4)
+		f.send(f.answerTTL(3600, 1, "fe80::62"), ifCable)
+		f.next()
+		time.Sleep(1100 * time.Millisecond)
+
+		// when: it comes back unchanged
+		f.send(f.answer(3600, "fe80::62"), ifCable)
+
+		// then
+		if got, want := addrStrings(f.next()), []string{"fe80::62%if31"}; !reflect.DeepEqual(got, want) {
+			t.Errorf("got %v, want %v", got, want)
+		}
+	})
+
+	t.Run("an AAAA lives at most two minutes without being heard", func(t *testing.T) {
+		// given
+		var a answerAddrs
+		now := time.Now()
+
+		// when: Bonjour's 4500 s
+		a.add(net.ParseIP("fe80::62"), ifCable, dns.RR_Header{Ttl: 4500}, now)
+		a.add(net.ParseIP("192.168.1.62"), ifWifi, dns.RR_Header{Ttl: 4500}, now)
+
+		// then
+		if got := a.v6[0].exp.Sub(now); got != maxIPv6TTL {
+			t.Errorf("AAAA lives %v, want %v", got, maxIPv6TTL)
+		}
+		if got := a.v4[0].exp.Sub(now); got != 4500*time.Second {
+			t.Errorf("A lives %v, want its own TTL", got)
+		}
+	})
+
 	t.Run("a cold split announcement resolves", func(t *testing.T) {
 		// given: PTR and SRV first, nothing known yet
 		f := newMainloopFixture(t, cableClient(), true, 4)

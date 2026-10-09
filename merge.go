@@ -35,8 +35,20 @@ type answerAddrs struct {
 	flush4, flush6 bool
 }
 
+// maxIPv6TTL caps how long an AAAA record stays live without being heard
+// again. Bonjour announces 4500 s, but a link-local address on a link the
+// peer has left (without a goodbye) would be dialed first for that long; the
+// browser asks at least once a minute and peers answer every query, so a
+// live address keeps being renewed. 120 s is the address TTL RFC 6762 10
+// recommends and our responder uses.
+const maxIPv6TTL = 120 * time.Second
+
 func (a *answerAddrs) add(ip net.IP, ifIndex int, hdr dns.RR_Header, now time.Time) {
-	rec := addrRecord{ip: ip, exp: now.Add(time.Duration(hdr.Ttl) * time.Second), seen: now}
+	ttl := time.Duration(hdr.Ttl) * time.Second
+	if ip.To4() == nil && ttl > maxIPv6TTL {
+		ttl = maxIPv6TTL
+	}
+	rec := addrRecord{ip: ip, exp: now.Add(ttl), seen: now}
 	flush := hdr.Class&qClassCacheFlush != 0
 	if ip.To4() != nil {
 		a.v4 = append(a.v4, rec)
@@ -99,7 +111,10 @@ type instanceAddrs struct {
 	// the last one says goodbye, an address record alone (the host may
 	// still answer for other services) must not revive the instance
 	serviceLinks map[int]struct{}
-	cached       *ServiceEntry // the last entry template handed out
+	// withdrawn are the links whose service said goodbye: an address
+	// record alone does not bring the link back, fresh service records do
+	withdrawn map[int]struct{}
+	cached    *ServiceEntry // the last entry template handed out
 }
 
 type ifaceAddrs map[string]*instanceAddrs
@@ -115,6 +130,10 @@ func (m ifaceAddrs) update(key string, ifIndex int, fresh *ServiceEntry, addrs *
 	if !fresh.Expiry.After(now) {
 		delete(inst.links, ifIndex)
 		delete(inst.serviceLinks, ifIndex)
+		if inst.withdrawn == nil {
+			inst.withdrawn = map[int]struct{}{}
+		}
+		inst.withdrawn[ifIndex] = struct{}{}
 		return
 	}
 	if fresh != inst.cached {
@@ -123,6 +142,7 @@ func (m ifaceAddrs) update(key string, ifIndex int, fresh *ServiceEntry, addrs *
 			inst.serviceLinks = map[int]struct{}{}
 		}
 		inst.serviceLinks[ifIndex] = struct{}{}
+		delete(inst.withdrawn, ifIndex)
 	}
 	inst.expiry = fresh.Expiry
 	if inst.tmpl == nil {
@@ -162,9 +182,12 @@ func (m ifaceAddrs) fillTarget(key string, e *ServiceEntry, now time.Time) {
 // template returns an entry for an instance whose target is hostName, to
 // carry address records that arrived without the service records (a split
 // announcement, a renewal of the address alone); nil when none is known.
-func (m ifaceAddrs) template(key, hostName string, now time.Time) *ServiceEntry {
+func (m ifaceAddrs) template(key, hostName string, ifIndex int, now time.Time) *ServiceEntry {
 	inst := m[key]
 	if inst == nil || inst.tmpl == nil || inst.host != hostName || !inst.expiry.After(now) || len(inst.serviceLinks) == 0 {
+		return nil
+	}
+	if _, gone := inst.withdrawn[ifIndex]; gone {
 		return nil
 	}
 	e := *inst.tmpl
@@ -191,6 +214,23 @@ func (m ifaceAddrs) prune(now time.Time) {
 			delete(m, key)
 		}
 	}
+}
+
+// deliverable reports whether the instance has a resolved target and a live
+// address, i.e. whether entry would return ok.
+func (m ifaceAddrs) deliverable(key string, now time.Time) bool {
+	inst := m[key]
+	if inst == nil || inst.port == 0 {
+		return false
+	}
+	for _, link := range inst.links {
+		for _, r := range slices.Concat(link.v4, link.v6) {
+			if r.exp.After(now) {
+				return true
+			}
+		}
+	}
+	return false
 }
 
 // entry returns the instance as one entry: the last resolved target with the
