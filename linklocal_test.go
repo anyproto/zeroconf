@@ -429,16 +429,16 @@ func TestMainloopMergesAnswersFromSelectedLinks(t *testing.T) {
 		}
 	})
 
-	t.Run("a new port is delivered", func(t *testing.T) {
+	t.Run("a new port of a cable peer is delivered", func(t *testing.T) {
 		// given
 		f := newMainloopFixture(t, cableClient(), true, 4)
-		f.send(f.answer(3600, "192.168.1.62"), ifWifi)
+		f.send(f.answer(3600, "fe80::62"), ifCable)
 		f.next()
 
 		// when
-		moved := f.answer(3600, "192.168.1.62")
+		moved := f.answer(3600, "fe80::62")
 		moved.Extra[0].(*dns.SRV).Port = 4007
-		f.send(moved, ifWifi)
+		f.send(moved, ifCable)
 
 		// then
 		if e := f.next(); e.Port != 4007 {
@@ -677,6 +677,40 @@ func TestMainloopMergesAnswersFromSelectedLinks(t *testing.T) {
 		f.none()
 	})
 
+	t.Run("a peer never seen over the cable keeps its first answer", func(t *testing.T) {
+		// given: a cable is selected, but this peer is on Wi-Fi only
+		f := newMainloopFixture(t, cableClient(), true, 4)
+		f.send(f.answer(3600, "192.168.1.62"), ifWifi)
+		f.next()
+
+		// when: its addresses arrive split, and its port changes
+		f.send(f.answer(3600, "192.168.1.63"), ifWifi)
+		moved := f.answer(3600, "192.168.1.62")
+		moved.Extra[0].(*dns.SRV).Port = 4007
+		f.send(moved, ifWifi)
+
+		// then: as without a cable
+		f.none()
+	})
+
+	t.Run("a cable peer returning after its link-local expired is delivered again", func(t *testing.T) {
+		// given: link-local with a 1 s TTL beside a long-lived IPv4
+		f := newMainloopFixture(t, cableClient(), true, 4)
+		f.send(f.answerTTL(3600, 3600, "169.254.2.3"), ifWifi)
+		f.next()
+		f.send(f.answerTTL(3600, 1, "fe80::62"), ifCable)
+		f.next()
+		time.Sleep(1100 * time.Millisecond)
+
+		// when: it answers again over the cable, unchanged
+		f.send(f.answer(3600, "fe80::62"), ifCable)
+
+		// then
+		if got, want := addrStrings(f.next()), []string{"169.254.2.3", "fe80::62%if31"}; !reflect.DeepEqual(got, want) {
+			t.Errorf("got %v, want %v", got, want)
+		}
+	})
+
 	t.Run("without selected IPv6 links the first answer is final", func(t *testing.T) {
 		// given
 		f := newMainloopFixture(t, &client{}, true, 4)
@@ -690,6 +724,23 @@ func TestMainloopMergesAnswersFromSelectedLinks(t *testing.T) {
 		// then
 		f.none()
 	})
+}
+
+func TestIPv4OnlyBrowsingKeepsDeliveriesAcrossCleanup(t *testing.T) {
+	// given: no IPv6 selection, a delivered peer, a cleanup tick
+	origCleanup := cleanupFreq
+	cleanupFreq = 100 * time.Millisecond
+	t.Cleanup(func() { cleanupFreq = origCleanup })
+	f := newMainloopFixture(t, &client{}, true, 4)
+	f.send(f.answer(3600, "192.168.1.62"), ifWifi)
+	f.next()
+	time.Sleep(300 * time.Millisecond)
+
+	// when: the same answer again, its service TTL far from expiry
+	f.send(f.answer(3600, "192.168.1.62"), ifWifi)
+
+	// then
+	f.none()
 }
 
 func TestLookupReturnsAfterItsFirstResult(t *testing.T) {

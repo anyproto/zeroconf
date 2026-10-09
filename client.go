@@ -311,12 +311,15 @@ func (c *client) mainloop(ctx context.Context, params *lookupParams, msgCh <-cha
 			// address records expire on their own TTLs, not on the
 			// last delivery's
 			byIface.prune(t)
-			// an instance whose addresses all expired may come back
-			// unchanged: forget its delivery so that is delivered again
-			for k := range sentKeys {
-				if !byIface.deliverable(k, t) {
-					delete(sentEntries, k)
-					delete(sentKeys, k)
+			// an instance some of whose delivered addresses expired may
+			// come back unchanged: forget its delivery so that is
+			// delivered again
+			if merging {
+				for k, delivered := range sentKeys {
+					if byIface.usesLinkLocal(k) && byIface.currentKey(k, t, c.ipv6Ifaces) != delivered {
+						delete(sentEntries, k)
+						delete(sentKeys, k)
+					}
 				}
 			}
 			continue
@@ -440,8 +443,9 @@ func (c *client) mainloop(ctx context.Context, params *lookupParams, msgCh <-cha
 			for k, e := range entries {
 				var key string
 				if merging {
-					if _, sent := sentKeys[k]; sent && !byIface.deliverable(k, now) {
-						// everything delivered before expired (the cleanup
+					if delivered, sent := sentKeys[k]; sent && byIface.usesLinkLocal(k) &&
+						byIface.currentKey(k, now, c.ipv6Ifaces) != delivered {
+						// some of what was delivered expired (the cleanup
 						// tick may not have run yet): a peer coming back
 						// unchanged is news
 						delete(sentEntries, k)
@@ -450,12 +454,15 @@ func (c *client) mainloop(ctx context.Context, params *lookupParams, msgCh <-cha
 					byIface.update(k, ifIndex, e, records[k], now)
 					merged, mergedKey, ok := byIface.entry(k, e, now, c.ipv6Ifaces)
 					if !ok {
-						// nothing deliverable (a goodbye on the last link)
-						delete(sentEntries, k)
-						delete(sentKeys, k)
+						if !e.Expiry.After(now) || byIface.usesLinkLocal(k) {
+							// a goodbye on the last link, or nothing
+							// left to dial
+							delete(sentEntries, k)
+							delete(sentKeys, k)
+						}
 						continue
 					}
-					if _, sent := sentEntries[k]; sent && mergedKey == sentKeys[k] {
+					if _, sent := sentEntries[k]; sent && (mergedKey == sentKeys[k] || !byIface.usesLinkLocal(k)) {
 						continue
 					}
 					e, key = merged, mergedKey
@@ -483,7 +490,9 @@ func (c *client) mainloop(ctx context.Context, params *lookupParams, msgCh <-cha
 				// This is also a point to possibly stop probing actively for a
 				// service entry.
 				sentEntries[k] = e
-				sentKeys[k] = key
+				if merging {
+					sentKeys[k] = key
+				}
 				if !send(e) {
 					return
 				}

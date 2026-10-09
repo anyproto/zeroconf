@@ -115,6 +115,11 @@ type instanceAddrs struct {
 	// record alone does not bring the link back, fresh service records do
 	withdrawn map[int]struct{}
 	cached    *ServiceEntry // the last entry template handed out
+	// linkLocal says the instance had a usable link-local address on a
+	// selected interface: only such an instance is delivered again when
+	// its addresses change. Any other keeps the first answer, as without
+	// selected interfaces, so a cable elsewhere changes nothing for it.
+	linkLocal bool
 }
 
 type ifaceAddrs map[string]*instanceAddrs
@@ -216,21 +221,27 @@ func (m ifaceAddrs) prune(now time.Time) {
 	}
 }
 
-// deliverable reports whether the instance has a resolved target and a live
-// address, i.e. whether entry would return ok.
-func (m ifaceAddrs) deliverable(key string, now time.Time) bool {
+// usesLinkLocal reports whether the instance is delivered again on change,
+// see instanceAddrs.linkLocal.
+func (m ifaceAddrs) usesLinkLocal(key string) bool {
 	inst := m[key]
-	if inst == nil || inst.port == 0 {
-		return false
+	return inst != nil && inst.linkLocal
+}
+
+// currentKey is the delivery key the instance has now from its cache alone
+// (see entry), or "" when nothing is deliverable. A delivered key that no
+// longer matches means some of what was delivered expired: a peer coming
+// back unchanged is news then.
+func (m ifaceAddrs) currentKey(key string, now time.Time, selected map[int]struct{}) string {
+	inst := m[key]
+	if inst == nil || inst.tmpl == nil {
+		return ""
 	}
-	for _, link := range inst.links {
-		for _, r := range slices.Concat(link.v4, link.v6) {
-			if r.exp.After(now) {
-				return true
-			}
-		}
+	_, k, ok := m.entry(key, inst.tmpl, now, selected)
+	if !ok {
+		return ""
 	}
-	return false
+	return k
 }
 
 // entry returns the instance as one entry: the last resolved target with the
@@ -274,6 +285,7 @@ func (m ifaceAddrs) entry(key string, fresh *ServiceEntry, now time.Time, select
 			e.AddrIPv6Zoned = append(e.AddrIPv6Zoned, r.zoned)
 			if sel && r.zoned.Zone() != "" {
 				usable = append(usable, r.zoned.String())
+				inst.linkLocal = true
 			}
 		}
 	}
