@@ -174,14 +174,18 @@ func (m ifaceAddrs) update(key string, ifIndex int, fresh *ServiceEntry, addrs *
 	link.v6 = mergeRecords(link.v6, addrs.v6, addrs.flush6, now)
 }
 
-// fillTarget gives a partial entry of this packet (PTR or TXT without SRV)
-// the instance's resolved target, so its address records can be matched.
-func (m ifaceAddrs) fillTarget(key string, e *ServiceEntry, now time.Time) {
-	inst := m[key]
-	if e.HostName != "" || inst == nil || inst.port == 0 || !inst.expiry.After(now) || len(inst.serviceLinks) == 0 {
-		return
+// target is the host an entry's address records belong to: the packet's own
+// SRV target, or for a partial entry (PTR or TXT without SRV) the instance's
+// resolved one. The entry itself is left as the packet made it.
+func (m ifaceAddrs) target(key string, e *ServiceEntry, now time.Time) string {
+	if e.HostName != "" {
+		return e.HostName
 	}
-	e.HostName, e.Port = inst.host, inst.port
+	inst := m[key]
+	if inst == nil || inst.port == 0 || !inst.expiry.After(now) || len(inst.serviceLinks) == 0 {
+		return ""
+	}
+	return inst.host
 }
 
 // template returns an entry for an instance whose target is hostName, to

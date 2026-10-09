@@ -388,9 +388,6 @@ func (c *client) mainloop(ctx context.Context, params *lookupParams, msgCh <-cha
 				// address records without their service records in this
 				// packet belong to the instances already resolved to
 				// that target
-				for k, e := range entries {
-					byIface.fillTarget(k, e, now)
-				}
 				for _, answer := range sections {
 					var name string
 					switch rr := answer.(type) {
@@ -414,12 +411,23 @@ func (c *client) mainloop(ctx context.Context, params *lookupParams, msgCh <-cha
 					}
 				}
 			}
+			// the merge cache matches address records to a partial entry's
+			// resolved target too; the entry keeps only its own (see target)
+			targets := make(map[string]string, len(entries))
+			for k, e := range entries {
+				targets[k] = e.HostName
+				if merging {
+					targets[k] = byIface.target(k, e, now)
+				}
+			}
 			for _, answer := range sections {
 				switch rr := answer.(type) {
 				case *dns.A:
 					for k, e := range entries {
 						if e.HostName == rr.Hdr.Name {
 							entries[k].AddrIPv4 = append(entries[k].AddrIPv4, rr.A)
+						}
+						if targets[k] == rr.Hdr.Name {
 							addRecord(k, rr.A, rr.Hdr)
 						}
 					}
@@ -430,6 +438,8 @@ func (c *client) mainloop(ctx context.Context, params *lookupParams, msgCh <-cha
 							if zoned, ok := zonedIPv6(rr.AAAA, ifIndex); ok {
 								entries[k].AddrIPv6Zoned = append(entries[k].AddrIPv6Zoned, zoned)
 							}
+						}
+						if targets[k] == rr.Hdr.Name {
 							addRecord(k, rr.AAAA, rr.Hdr)
 						}
 					}

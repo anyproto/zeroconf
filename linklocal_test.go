@@ -767,6 +767,26 @@ func TestMainloopMergesAnswersFromSelectedLinks(t *testing.T) {
 		}
 	})
 
+	t.Run("a Wi-Fi peer's partial answer is not completed from the cache", func(t *testing.T) {
+		// given: a cable is selected; the peer's SRV (port 4006) came
+		// without addresses
+		f := newMainloopFixture(t, cableClient(), true, 4)
+		f.send(f.answer(3600), ifWifi)
+
+		// when: it restarted on 4007; PTR+A arrive before the new SRV
+		partial := f.answer(3600, "192.168.1.62")
+		partial.Extra = partial.Extra[1:]
+		f.send(partial, ifWifi)
+		moved := f.answer(3600, "192.168.1.62")
+		moved.Extra[0].(*dns.SRV).Port = 4007
+		f.send(moved, ifWifi)
+
+		// then: as without a cable, the first complete answer
+		if e := f.next(); e.Port != 4007 {
+			t.Errorf("port = %d, want 4007", e.Port)
+		}
+	})
+
 	t.Run("without selected IPv6 links the first answer is final", func(t *testing.T) {
 		// given
 		f := newMainloopFixture(t, &client{}, true, 4)
