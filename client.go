@@ -7,7 +7,9 @@ import (
 	"log"
 	"math/rand"
 	"net"
+	"net/netip"
 	"runtime"
+	"strconv"
 	"strings"
 	"time"
 
@@ -132,10 +134,18 @@ func applyOpts(options ...ClientOption) clientOpts {
 
 func (c *client) run(ctx context.Context, params *lookupParams) error {
 	ctx, cancel := context.WithCancel(ctx)
+	// start listening for responses
+	msgCh := make(chan receivedMsg, 32)
+	if c.ipv4conn != nil {
+		go c.recv(ctx, c.ipv4conn, msgCh)
+	}
+	if c.ipv6conn != nil {
+		go c.recv(ctx, c.ipv6conn, msgCh)
+	}
 	done := make(chan struct{})
 	go func() {
 		defer close(done)
-		c.mainloop(ctx, params)
+		c.mainloop(ctx, params, msgCh)
 	}()
 
 	// If previous probe was ok, it should be fine now. In case of an error later on,
@@ -158,23 +168,21 @@ func newClient(opts clientOpts) (*client, error) {
 		ifaces = listMulticastInterfaces()
 	}
 	ifaceList := NewInterfaceList(ifaces)
+	// When both families are requested, one that cannot join (IPv6 disabled
+	// on the host, say) must not take the other down with it.
+	var err4, err6 error
 	// IPv4 interfaces
 	var ipv4conn *ipv4.PacketConn
 	if (opts.listenOn & IPv4) > 0 {
-		var err error
-		ipv4conn, err = joinUdp4Multicast(ifaceList)
-		if err != nil {
-			return nil, err
-		}
+		ipv4conn, err4 = joinUdp4Multicast(ifaceList)
 	}
 	// IPv6 interfaces
 	var ipv6conn *ipv6.PacketConn
 	if (opts.listenOn & IPv6) > 0 {
-		var err error
-		ipv6conn, err = joinUdp6Multicast(ifaceList)
-		if err != nil {
-			return nil, err
-		}
+		ipv6conn, err6 = joinUdp6Multicast(ifaceList)
+	}
+	if ipv4conn == nil && ipv6conn == nil {
+		return nil, errors.Join(err4, err6)
 	}
 
 	return &client{
@@ -187,16 +195,43 @@ func newClient(opts clientOpts) (*client, error) {
 
 var cleanupFreq = 10 * time.Second
 
+// receivedMsg is a decoded packet with the index of the interface it arrived
+// on (0 when the platform does not report it).
+type receivedMsg struct {
+	msg     *dns.Msg
+	ifIndex int
+}
+
+// interfaceZone names the interface a link-local address is reached through:
+// its name, or the decimal index when the name is unknown. net.Dial accepts
+// both. A var so tests can stub the lookup.
+var interfaceZone = func(ifIndex int) string {
+	if iface, err := net.InterfaceByIndex(ifIndex); err == nil && iface.Name != "" {
+		return iface.Name
+	}
+	return strconv.Itoa(ifIndex)
+}
+
+// zonedIPv6 converts an AAAA address for ServiceEntry.AddrIPv6Zoned: a
+// link-local one gets the receiving interface as its zone, and is dropped when
+// that interface is unknown.
+func zonedIPv6(ip net.IP, ifIndex int) (netip.Addr, bool) {
+	addr, ok := netip.AddrFromSlice(ip)
+	if !ok {
+		return netip.Addr{}, false
+	}
+	addr = addr.Unmap()
+	if !addr.IsLinkLocalUnicast() {
+		return addr, true
+	}
+	if ifIndex <= 0 {
+		return netip.Addr{}, false
+	}
+	return addr.WithZone(interfaceZone(ifIndex)), true
+}
+
 // Start listeners and waits for the shutdown signal from exit channel
-func (c *client) mainloop(ctx context.Context, params *lookupParams) {
-	// start listening for responses
-	msgCh := make(chan *dns.Msg, 32)
-	if c.ipv4conn != nil {
-		go c.recv(ctx, c.ipv4conn, msgCh)
-	}
-	if c.ipv6conn != nil {
-		go c.recv(ctx, c.ipv6conn, msgCh)
-	}
+func (c *client) mainloop(ctx context.Context, params *lookupParams, msgCh <-chan receivedMsg) {
 
 	// Iterate through channels from listeners goroutines
 	var entries map[string]*ServiceEntry
@@ -219,7 +254,8 @@ func (c *client) mainloop(ctx context.Context, params *lookupParams) {
 				}
 			}
 			continue
-		case msg := <-msgCh:
+		case received := <-msgCh:
+			msg := received.msg
 			now = time.Now()
 			entries = make(map[string]*ServiceEntry)
 			sections := append(msg.Answer, msg.Ns...)
@@ -285,6 +321,9 @@ func (c *client) mainloop(ctx context.Context, params *lookupParams) {
 					for k, e := range entries {
 						if e.HostName == rr.Hdr.Name {
 							entries[k].AddrIPv6 = append(entries[k].AddrIPv6, rr.AAAA)
+							if zoned, ok := zonedIPv6(rr.AAAA, received.ifIndex); ok {
+								entries[k].AddrIPv6Zoned = append(entries[k].AddrIPv6Zoned, zoned)
+							}
 						}
 					}
 				}
@@ -336,18 +375,29 @@ func (c *client) shutdown() {
 
 // Data receiving routine reads from connection, unpacks packets into dns.Msg
 // structures and sends them to a given msgCh channel
-func (c *client) recv(ctx context.Context, l interface{}, msgCh chan *dns.Msg) {
-	var readFrom func([]byte) (n int, src net.Addr, err error)
+func (c *client) recv(ctx context.Context, l interface{}, msgCh chan<- receivedMsg) {
+	var readFrom func([]byte) (n int, ifIndex int, err error)
 
+	// the control message carries the receiving interface: a link-local
+	// address in the answer is only reachable through it. It is nil where
+	// the platform does not implement control messages (Windows).
 	switch pConn := l.(type) {
 	case *ipv6.PacketConn:
-		readFrom = func(b []byte) (n int, src net.Addr, err error) {
-			n, _, src, err = pConn.ReadFrom(b)
+		readFrom = func(b []byte) (n int, ifIndex int, err error) {
+			var cm *ipv6.ControlMessage
+			n, cm, _, err = pConn.ReadFrom(b)
+			if cm != nil {
+				ifIndex = cm.IfIndex
+			}
 			return
 		}
 	case *ipv4.PacketConn:
-		readFrom = func(b []byte) (n int, src net.Addr, err error) {
-			n, _, src, err = pConn.ReadFrom(b)
+		readFrom = func(b []byte) (n int, ifIndex int, err error) {
+			var cm *ipv4.ControlMessage
+			n, cm, _, err = pConn.ReadFrom(b)
+			if cm != nil {
+				ifIndex = cm.IfIndex
+			}
 			return
 		}
 
@@ -363,7 +413,7 @@ func (c *client) recv(ctx context.Context, l interface{}, msgCh chan *dns.Msg) {
 // closed. Transient read errors are retried with a growing backoff (see
 // nextRecvBackoff), mirroring the server recv loops: a persistently erroring
 // socket must neither busy-spin a core nor silently kill reception.
-func recvLoop(ctx context.Context, readFrom func([]byte) (n int, src net.Addr, err error), msgCh chan *dns.Msg) {
+func recvLoop(ctx context.Context, readFrom func([]byte) (n int, ifIndex int, err error), msgCh chan<- receivedMsg) {
 	buf := make([]byte, 65536)
 	var backoff time.Duration
 	for {
@@ -371,7 +421,7 @@ func recvLoop(ctx context.Context, readFrom func([]byte) (n int, src net.Addr, e
 			return
 		}
 
-		n, _, err := readFrom(buf)
+		n, ifIndex, err := readFrom(buf)
 		if err != nil {
 			if errors.Is(err, net.ErrClosed) {
 				// The connection was closed (shutdown path): terminal.
@@ -392,7 +442,7 @@ func recvLoop(ctx context.Context, readFrom func([]byte) (n int, src net.Addr, e
 			continue
 		}
 		select {
-		case msgCh <- msg:
+		case msgCh <- receivedMsg{msg: msg, ifIndex: ifIndex}:
 			// Submit decoded DNS message and continue.
 		case <-ctx.Done():
 			// Abort.

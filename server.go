@@ -27,9 +27,10 @@ var (
 )
 
 type serverOpts struct {
-	ttl          uint32
-	listenOn     IPType
-	writeTimeout time.Duration
+	ttl             uint32
+	listenOn        IPType
+	writeTimeout    time.Duration
+	linkLocalIfaces map[int]struct{}
 }
 
 func applyServerOpts(options ...ServerOption) serverOpts {
@@ -69,6 +70,19 @@ func WriteTimeout(duration time.Duration) ServerOption {
 func ServerSelectIPTraffic(t IPType) ServerOption {
 	return func(o *serverOpts) {
 		o.listenOn = t
+	}
+}
+
+// ServerLinkLocalIPv6 makes an answer sent on one of the listed interfaces
+// carry that interface's own IPv6 link-local addresses, on top of the fixed
+// address list of RegisterProxy. A link-local address is only reachable
+// through its own link, so it is never announced on another interface.
+func ServerLinkLocalIPv6(ifIndexes ...int) ServerOption {
+	return func(o *serverOpts) {
+		o.linkLocalIfaces = make(map[int]struct{}, len(ifIndexes))
+		for _, i := range ifIndexes {
+			o.linkLocalIfaces[i] = struct{}{}
+		}
 	}
 }
 
@@ -193,6 +207,8 @@ type Server struct {
 	isShutdown     bool
 	ttl            uint32
 	writeTimeout   time.Duration
+	// linkLocalIfaces: see ServerLinkLocalIPv6
+	linkLocalIfaces map[int]struct{}
 }
 
 // Constructs server structure
@@ -204,10 +220,11 @@ func newServer(ifaces []net.Interface, opts serverOpts) (*Server, error) {
 	ifaceList := NewInterfaceList(ifaces)
 
 	s := &Server{
-		interfaces:     ifaceList,
-		ttl:            opts.ttl,
-		writeTimeout:   opts.writeTimeout,
-		shouldShutdown: make(chan struct{}),
+		interfaces:      ifaceList,
+		ttl:             opts.ttl,
+		writeTimeout:    opts.writeTimeout,
+		shouldShutdown:  make(chan struct{}),
+		linkLocalIfaces: opts.linkLocalIfaces,
 	}
 
 	var err error
@@ -735,6 +752,9 @@ func (s *Server) appendAddrs(list []dns.RR, ttl uint32, ifIndex int, flushCache 
 			v6 = append(v6, a6...)
 		}
 	}
+	if _, ok := s.linkLocalIfaces[ifIndex]; ok && ifIndex != 0 {
+		v6 = appendLinkLocal(v6, ifIndex)
+	}
 	if ttl > 0 {
 		// RFC6762 Section 10 says A/AAAA records SHOULD
 		// use TTL of 120s, to account for network interface
@@ -770,6 +790,42 @@ func (s *Server) appendAddrs(list []dns.RR, ttl uint32, ifIndex int, flushCache 
 		list = append(list, aaaa)
 	}
 	return list
+}
+
+// interfaceAddrs lists an interface's addresses by index. A var so tests can
+// stub the lookup.
+var interfaceAddrs = func(ifIndex int) ([]net.Addr, error) {
+	iface, err := net.InterfaceByIndex(ifIndex)
+	if err != nil {
+		return nil, err
+	}
+	return iface.Addrs()
+}
+
+// appendLinkLocal adds the IPv6 link-local addresses of interface ifIndex
+// that v6 does not hold yet.
+func appendLinkLocal(v6 []net.IP, ifIndex int) []net.IP {
+	addrs, err := interfaceAddrs(ifIndex)
+	if err != nil {
+		return v6
+	}
+	for _, address := range addrs {
+		ipnet, ok := address.(*net.IPNet)
+		if !ok || ipnet.IP.To4() != nil || !ipnet.IP.IsLinkLocalUnicast() {
+			continue
+		}
+		known := false
+		for _, ip := range v6 {
+			if ip.Equal(ipnet.IP) {
+				known = true
+				break
+			}
+		}
+		if !known {
+			v6 = append(v6, ipnet.IP)
+		}
+	}
+	return v6
 }
 
 func addrsForInterface(iface *net.Interface) ([]net.IP, []net.IP) {
