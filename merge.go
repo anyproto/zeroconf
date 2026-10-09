@@ -7,6 +7,8 @@ import (
 	"strconv"
 	"strings"
 	"time"
+
+	"github.com/miekg/dns"
 )
 
 // A browser selected IPv6 interfaces (SelectIPv6Ifaces) for a link that has
@@ -25,20 +27,44 @@ type addrRecord struct {
 }
 
 // answerAddrs are the address records one message carried for one instance.
+// flush4/flush6 say a record of that family had the cache-flush bit: the
+// sender lists its complete set, which replaces what the link had.
 type answerAddrs struct {
-	v4, v6 []addrRecord
+	v4, v6         []addrRecord
+	flush4, flush6 bool
 }
 
-func (a *answerAddrs) add(ip net.IP, ifIndex int, ttl uint32, now time.Time) {
-	rec := addrRecord{ip: ip, exp: now.Add(time.Duration(ttl) * time.Second)}
+func (a *answerAddrs) add(ip net.IP, ifIndex int, hdr dns.RR_Header, now time.Time) {
+	rec := addrRecord{ip: ip, exp: now.Add(time.Duration(hdr.Ttl) * time.Second)}
+	flush := hdr.Class&qClassCacheFlush != 0
 	if ip.To4() != nil {
 		a.v4 = append(a.v4, rec)
+		a.flush4 = a.flush4 || flush
 		return
 	}
 	if zoned, ok := zonedIPv6(ip, ifIndex); ok {
 		rec.zoned = zoned
 	}
 	a.v6 = append(a.v6, rec)
+	a.flush6 = a.flush6 || flush
+}
+
+// mergeRecords applies records to a link's family: a cache-flush set
+// replaces it; otherwise each record renews, adds or (TTL 0) withdraws its
+// own address and leaves the others.
+func mergeRecords(have, records []addrRecord, flush bool) []addrRecord {
+	if flush {
+		return slices.Clone(records)
+	}
+	res := slices.Clone(have)
+	for _, r := range records {
+		if i := slices.IndexFunc(res, func(h addrRecord) bool { return h.ip.Equal(r.ip) }); i >= 0 {
+			res[i] = r
+		} else {
+			res = append(res, r)
+		}
+	}
+	return res
 }
 
 // linkAddrs is what one interface last told us about one instance, per
@@ -59,6 +85,7 @@ type instanceAddrs struct {
 	port      int
 	text      []string
 	expiry    time.Time
+	tmpl      *ServiceEntry // the instance's service record, see template
 }
 
 type ifaceAddrs map[string]*instanceAddrs
@@ -76,6 +103,11 @@ func (m ifaceAddrs) update(key string, ifIndex int, fresh *ServiceEntry, addrs *
 		return
 	}
 	inst.expiry = fresh.Expiry
+	if inst.tmpl == nil {
+		tmpl := *fresh
+		tmpl.AddrIPv4, tmpl.AddrIPv6, tmpl.AddrIPv6Zoned = nil, nil, nil
+		inst.tmpl = &tmpl
+	}
 	if fresh.Port != 0 && fresh.HostName != "" {
 		inst.host, inst.port = fresh.HostName, fresh.Port
 	}
@@ -91,12 +123,22 @@ func (m ifaceAddrs) update(key string, ifIndex int, fresh *ServiceEntry, addrs *
 		inst.nextOrder++
 		inst.links[ifIndex] = link
 	}
-	if len(addrs.v4) > 0 {
-		link.v4 = addrs.v4
+	link.v4 = mergeRecords(link.v4, addrs.v4, addrs.flush4)
+	link.v6 = mergeRecords(link.v6, addrs.v6, addrs.flush6)
+}
+
+// template returns an entry for an instance whose target is hostName, to
+// carry address records that arrived without the service records (a split
+// announcement, a renewal of the address alone); nil when none is known.
+func (m ifaceAddrs) template(key, hostName string, now time.Time) *ServiceEntry {
+	inst := m[key]
+	if inst == nil || inst.tmpl == nil || inst.host != hostName || !inst.expiry.After(now) {
+		return nil
 	}
-	if len(addrs.v6) > 0 {
-		link.v6 = addrs.v6
-	}
+	e := *inst.tmpl
+	e.HostName, e.Port, e.Text, e.Expiry = inst.host, inst.port, inst.text, inst.expiry
+	e.AddrIPv4, e.AddrIPv6, e.AddrIPv6Zoned = nil, nil, nil
+	return &e
 }
 
 // prune drops expired records, empty links and instances with no link left.

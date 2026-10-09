@@ -217,6 +217,16 @@ func newClient(opts clientOpts) (*client, error) {
 
 var cleanupFreq = 10 * time.Second
 
+// hasTarget reports whether an entry of this packet resolved to hostName.
+func hasTarget(entries map[string]*ServiceEntry, hostName string) bool {
+	for _, e := range entries {
+		if e.HostName == hostName {
+			return true
+		}
+	}
+	return false
+}
+
 // receivedMsg is a decoded packet with the index of the interface it arrived
 // on (0 when the platform does not report it).
 type receivedMsg struct {
@@ -258,7 +268,10 @@ func (c *client) mainloop(ctx context.Context, params *lookupParams, msgCh <-cha
 	// Iterate through channels from listeners goroutines
 	var entries map[string]*ServiceEntry
 	sentEntries := make(map[string]*ServiceEntry)
-	merging := params.isBrowsing && len(c.ipv6Ifaces) > 0
+	// not for service type enumeration, whose PTR-only results have no
+	// target or address to merge
+	merging := params.isBrowsing && len(c.ipv6Ifaces) > 0 &&
+		params.ServiceRecord.ServiceTypeName() != params.ServiceRecord.ServiceName()
 	byIface := ifaceAddrs{}
 	sentKeys := map[string]string{}
 	// send delivers e unless the context ends first: the subscriber may have
@@ -356,11 +369,38 @@ func (c *client) mainloop(ctx context.Context, params *lookupParams, msgCh <-cha
 			}
 			// Associate IPs in a second round as other fields should be filled by now.
 			records = make(map[string]*answerAddrs)
-			addRecord := func(k string, ip net.IP, ttl uint32) {
+			addRecord := func(k string, ip net.IP, hdr dns.RR_Header) {
 				if records[k] == nil {
 					records[k] = &answerAddrs{}
 				}
-				records[k].add(ip, ifIndex, ttl, now)
+				records[k].add(ip, ifIndex, hdr, now)
+			}
+			if merging {
+				// address records without their service records in this
+				// packet belong to the instances already resolved to
+				// that target
+				for _, answer := range sections {
+					var name string
+					switch rr := answer.(type) {
+					case *dns.A:
+						name = rr.Hdr.Name
+					case *dns.AAAA:
+						name = rr.Hdr.Name
+					default:
+						continue
+					}
+					if hasTarget(entries, name) {
+						continue
+					}
+					for k := range byIface {
+						if _, ok := entries[k]; ok {
+							continue
+						}
+						if tmpl := byIface.template(k, name, now); tmpl != nil {
+							entries[k] = tmpl
+						}
+					}
+				}
 			}
 			for _, answer := range sections {
 				switch rr := answer.(type) {
@@ -368,7 +408,7 @@ func (c *client) mainloop(ctx context.Context, params *lookupParams, msgCh <-cha
 					for k, e := range entries {
 						if e.HostName == rr.Hdr.Name {
 							entries[k].AddrIPv4 = append(entries[k].AddrIPv4, rr.A)
-							addRecord(k, rr.A, rr.Hdr.Ttl)
+							addRecord(k, rr.A, rr.Hdr)
 						}
 					}
 				case *dns.AAAA:
@@ -378,7 +418,7 @@ func (c *client) mainloop(ctx context.Context, params *lookupParams, msgCh <-cha
 							if zoned, ok := zonedIPv6(rr.AAAA, ifIndex); ok {
 								entries[k].AddrIPv6Zoned = append(entries[k].AddrIPv6Zoned, zoned)
 							}
-							addRecord(k, rr.AAAA, rr.Hdr.Ttl)
+							addRecord(k, rr.AAAA, rr.Hdr)
 						}
 					}
 				}

@@ -314,6 +314,17 @@ func addrStrings(e *ServiceEntry) []string {
 
 const ifWifi, ifCable = 4, 31
 
+// flushed sets the cache-flush bit on the message's address records.
+func flushed(msg *dns.Msg) *dns.Msg {
+	for _, rr := range msg.Extra {
+		switch rr.(type) {
+		case *dns.A, *dns.AAAA:
+			rr.Header().Class |= qClassCacheFlush
+		}
+	}
+	return msg
+}
+
 func cableClient() *client {
 	return &client{ipv6Ifaces: map[int]struct{}{ifCable: {}}}
 }
@@ -435,7 +446,22 @@ func TestMainloopMergesAnswersFromSelectedLinks(t *testing.T) {
 		}
 	})
 
-	t.Run("a newer answer on the same link replaces its addresses", func(t *testing.T) {
+	t.Run("a cache-flush answer on the same link replaces its addresses", func(t *testing.T) {
+		// given
+		f := newMainloopFixture(t, cableClient(), true, 4)
+		f.send(f.answer(3600, "fe80::1"), ifCable)
+		f.next()
+
+		// when
+		f.send(flushed(f.answer(3600, "fe80::2")), ifCable)
+
+		// then
+		if got, want := addrStrings(f.next()), []string{"fe80::2%if31"}; !reflect.DeepEqual(got, want) {
+			t.Errorf("got %v, want %v", got, want)
+		}
+	})
+
+	t.Run("an answer without cache-flush adds to the link", func(t *testing.T) {
 		// given
 		f := newMainloopFixture(t, cableClient(), true, 4)
 		f.send(f.answer(3600, "fe80::1"), ifCable)
@@ -445,8 +471,49 @@ func TestMainloopMergesAnswersFromSelectedLinks(t *testing.T) {
 		f.send(f.answer(3600, "fe80::2"), ifCable)
 
 		// then
-		if want := []string{"fe80::2%if31"}; !reflect.DeepEqual(addrStrings(f.next()), want) {
-			t.Errorf("want the replacement only")
+		if got, want := addrStrings(f.next()), []string{"fe80::1%if31", "fe80::2%if31"}; !reflect.DeepEqual(got, want) {
+			t.Errorf("got %v, want %v", got, want)
+		}
+	})
+
+	t.Run("a goodbye for one address keeps the others", func(t *testing.T) {
+		// given
+		f := newMainloopFixture(t, cableClient(), true, 4)
+		f.send(f.answer(3600, "192.168.1.62"), ifWifi)
+		f.next()
+		f.send(f.answer(3600, "fe80::62", "2001:db8::61"), ifCable)
+		f.next()
+
+		// when
+		f.send(f.answerTTL(3600, 0, "2001:db8::61"), ifCable)
+
+		// then: the global address was never usable, so nothing changed
+		f.none()
+		f.send(f.answerTTL(3600, 0, "fe80::62"), ifCable)
+		if got, want := addrStrings(f.next()), []string{"192.168.1.62"}; !reflect.DeepEqual(got, want) {
+			t.Errorf("got %v, want %v", got, want)
+		}
+	})
+
+	t.Run("addresses sent apart from the service records reach the entry", func(t *testing.T) {
+		// given: resolved over Wi-Fi
+		f := newMainloopFixture(t, cableClient(), true, 4)
+		f.send(f.answer(3600, "192.168.1.62"), ifWifi)
+		f.next()
+
+		// when: the cable carries a bare AAAA for the same target
+		bare := new(dns.Msg)
+		bare.Response = true
+		bare.Answer = []dns.RR{&dns.AAAA{Hdr: dns.RR_Header{Name: f.host, Rrtype: dns.TypeAAAA, Class: dns.ClassINET, Ttl: 120}, AAAA: net.ParseIP("fe80::62")}}
+		f.send(bare, ifCable)
+
+		// then
+		e := f.next()
+		if got, want := addrStrings(e), []string{"192.168.1.62", "fe80::62%if31"}; !reflect.DeepEqual(got, want) {
+			t.Errorf("got %v, want %v", got, want)
+		}
+		if e.Port != 4006 || e.Instance != "peer1" {
+			t.Errorf("entry = %s:%d, want peer1:4006", e.Instance, e.Port)
 		}
 	})
 
@@ -629,4 +696,35 @@ func TestJoinUdp6MulticastOnlySelected(t *testing.T) {
 			t.Errorf("%s joined although not selected", iface.Name)
 		}
 	}
+}
+
+func TestEnumerationIgnoresIPv6Selection(t *testing.T) {
+	// given: a service type enumeration with IPv6 interfaces selected
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	params := defaultParams("_services._dns-sd._udp")
+	entries := make(chan *ServiceEntry, 1)
+	params.Entries = entries
+	params.isBrowsing = true
+	msgCh := make(chan receivedMsg, 1)
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		cableClient().mainloop(ctx, params, msgCh)
+	}()
+
+	// when
+	msg := new(dns.Msg)
+	msg.Response = true
+	msg.Answer = []dns.RR{&dns.PTR{Hdr: dns.RR_Header{Name: params.ServiceName(), Rrtype: dns.TypePTR, Class: dns.ClassINET, Ttl: 120}, Ptr: "_anytype._tcp.local."}}
+	msgCh <- receivedMsg{msg: msg, ifIndex: ifCable}
+
+	// then
+	select {
+	case <-entries:
+	case <-ctx.Done():
+		t.Fatal("the enumeration result was not delivered")
+	}
+	cancel()
+	<-done
 }
