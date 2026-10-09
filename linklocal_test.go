@@ -210,77 +210,243 @@ func TestMainloopZonesLinkLocalByReceivingInterface(t *testing.T) {
 	}
 }
 
-func TestMainloopMergesAddressesFromLaterAnswers(t *testing.T) {
-	// given: the peer answers on Wi-Fi first, then over the cable
-	const ifCable = 31
+// mainloopFixture runs a browsing (or lookup) mainloop fed by hand.
+type mainloopFixture struct {
+	t        *testing.T
+	ctx      context.Context
+	cancel   context.CancelFunc
+	params   *lookupParams
+	entries  chan *ServiceEntry
+	msgCh    chan receivedMsg
+	done     chan struct{}
+	instance string
+	host     string
+}
+
+func newMainloopFixture(t *testing.T, cl *client, browsing bool, entriesBuf int) *mainloopFixture {
+	t.Helper()
 	orig := interfaceZone
 	t.Cleanup(func() { interfaceZone = orig })
-	interfaceZone = func(int) string { return "en16" }
+	interfaceZone = func(i int) string { return "if" + strconv.Itoa(i) }
 
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	t.Cleanup(cancel)
 	params := defaultParams("_anytype._tcp")
-	instance := "peer1." + params.ServiceName()
-	host := "peer1.local."
-	answer := func(addr dns.RR) *dns.Msg {
-		msg := new(dns.Msg)
-		msg.Response = true
-		msg.Answer = []dns.RR{&dns.PTR{Hdr: dns.RR_Header{Name: params.ServiceName(), Rrtype: dns.TypePTR, Class: dns.ClassINET, Ttl: 3600}, Ptr: instance}}
-		msg.Extra = []dns.RR{
-			&dns.SRV{Hdr: dns.RR_Header{Name: instance, Rrtype: dns.TypeSRV, Class: dns.ClassINET, Ttl: 3600}, Port: 4006, Target: host},
-			addr,
-		}
-		return msg
-	}
-	wifi := answer(&dns.A{Hdr: dns.RR_Header{Name: host, Rrtype: dns.TypeA, Class: dns.ClassINET, Ttl: 120}, A: net.ParseIP("192.168.1.62")})
-	cable := answer(&dns.AAAA{Hdr: dns.RR_Header{Name: host, Rrtype: dns.TypeAAAA, Class: dns.ClassINET, Ttl: 120}, AAAA: net.ParseIP("fe80::62")})
-
-	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
-	defer cancel()
-	entries := make(chan *ServiceEntry, 4)
+	entries := make(chan *ServiceEntry, entriesBuf)
 	params.Entries = entries
-	params.isBrowsing = true
-	msgCh := make(chan receivedMsg, 4)
-	done := make(chan struct{})
+	params.isBrowsing = browsing
+	if !browsing {
+		params.stopProbing = make(chan struct{})
+	}
+	f := &mainloopFixture{
+		t: t, ctx: ctx, cancel: cancel, params: params, entries: entries,
+		msgCh: make(chan receivedMsg, 8), done: make(chan struct{}),
+		instance: "peer1." + params.ServiceName(), host: "peer1.local.",
+	}
 	go func() {
-		defer close(done)
-		(&client{}).mainloop(ctx, params, msgCh)
+		defer close(f.done)
+		cl.mainloop(ctx, params, f.msgCh)
 	}()
-	next := func() *ServiceEntry {
-		select {
-		case e := <-entries:
-			return e
-		case <-ctx.Done():
-			t.Fatal("no entry delivered")
-			return nil
+	// stop the loop before the zone stub is restored (cleanups run LIFO)
+	t.Cleanup(func() {
+		cancel()
+		<-f.done
+	})
+	return f
+}
+
+// answer is a service answer with a service TTL and the given address records.
+func (f *mainloopFixture) answer(ttl uint32, addrs ...string) *dns.Msg {
+	msg := new(dns.Msg)
+	msg.Response = true
+	msg.Answer = []dns.RR{&dns.PTR{Hdr: dns.RR_Header{Name: f.params.ServiceName(), Rrtype: dns.TypePTR, Class: dns.ClassINET, Ttl: ttl}, Ptr: f.instance}}
+	msg.Extra = []dns.RR{&dns.SRV{Hdr: dns.RR_Header{Name: f.instance, Rrtype: dns.TypeSRV, Class: dns.ClassINET, Ttl: ttl}, Port: 4006, Target: f.host}}
+	for _, a := range addrs {
+		ip := net.ParseIP(a)
+		if ip.To4() != nil {
+			msg.Extra = append(msg.Extra, &dns.A{Hdr: dns.RR_Header{Name: f.host, Rrtype: dns.TypeA, Class: dns.ClassINET, Ttl: 120}, A: ip})
+		} else {
+			msg.Extra = append(msg.Extra, &dns.AAAA{Hdr: dns.RR_Header{Name: f.host, Rrtype: dns.TypeAAAA, Class: dns.ClassINET, Ttl: 120}, AAAA: ip})
 		}
 	}
+	return msg
+}
 
-	// when
-	msgCh <- receivedMsg{msg: wifi, ifIndex: 4}
-	first := next()
-	// the subscriber may reorder what it got (heart sorts AddrIPv4)
-	first.AddrIPv4[0] = net.ParseIP("192.0.2.1")
-	msgCh <- receivedMsg{msg: cable, ifIndex: ifCable}
-	second := next()
-	msgCh <- receivedMsg{msg: cable, ifIndex: ifCable}
-	msgCh <- receivedMsg{msg: wifi, ifIndex: 4}
+func (f *mainloopFixture) send(msg *dns.Msg, ifIndex int) {
+	f.msgCh <- receivedMsg{msg: msg, ifIndex: ifIndex}
+}
 
-	// then
-	if len(first.AddrIPv4) != 1 || len(first.AddrIPv6Zoned) != 0 {
-		t.Errorf("first entry = %v %v, want the Wi-Fi address only", first.AddrIPv4, first.AddrIPv6Zoned)
-	}
-	if len(second.AddrIPv4) != 1 || !second.AddrIPv4[0].Equal(net.ParseIP("192.168.1.62")) || !reflect.DeepEqual(second.AddrIPv6Zoned, []netip.Addr{netip.MustParseAddr("fe80::62%en16")}) {
-		t.Errorf("second entry = %v %v, want both addresses", second.AddrIPv4, second.AddrIPv6Zoned)
-	}
-	if len(first.AddrIPv6Zoned) != 0 {
-		t.Error("the delivered first entry was modified")
-	}
+func (f *mainloopFixture) next() *ServiceEntry {
+	f.t.Helper()
 	select {
-	case e := <-entries:
-		t.Errorf("repeated answers re-delivered %v", e)
+	case e := <-f.entries:
+		return e
+	case <-f.ctx.Done():
+		f.t.Fatal("no entry delivered")
+		return nil
+	}
+}
+
+func (f *mainloopFixture) none() {
+	f.t.Helper()
+	select {
+	case e := <-f.entries:
+		f.t.Errorf("unexpected delivery: %v %v", e.AddrIPv4, e.AddrIPv6Zoned)
 	case <-time.After(100 * time.Millisecond):
 	}
-	cancel()
-	<-done
+}
+
+func addrStrings(e *ServiceEntry) []string {
+	var res []string
+	for _, ip := range e.AddrIPv4 {
+		res = append(res, ip.String())
+	}
+	for _, a := range e.AddrIPv6Zoned {
+		res = append(res, a.String())
+	}
+	return res
+}
+
+const ifWifi, ifCable = 4, 31
+
+func cableClient() *client {
+	return &client{ipv6Ifaces: map[int]struct{}{ifCable: {}}}
+}
+
+func TestMainloopMergesAnswersFromSelectedLinks(t *testing.T) {
+	t.Run("a cable answer after a Wi-Fi answer delivers both", func(t *testing.T) {
+		// given
+		f := newMainloopFixture(t, cableClient(), true, 4)
+
+		// when
+		f.send(f.answer(3600, "192.168.1.62"), ifWifi)
+		first := f.next()
+		first.AddrIPv4[0] = net.ParseIP("192.0.2.1") // the subscriber owns what it got
+		f.send(f.answer(3600, "fe80::62"), ifCable)
+		second := f.next()
+		f.send(f.answer(3600, "fe80::62"), ifCable)
+		f.send(f.answer(3600, "192.168.1.62"), ifWifi)
+
+		// then
+		if want := []string{"192.168.1.62", "fe80::62%if31"}; !reflect.DeepEqual(addrStrings(second), want) {
+			t.Errorf("second delivery = %v, want %v", addrStrings(second), want)
+		}
+		f.none()
+	})
+
+	t.Run("an answer on one link does not renew another link's addresses", func(t *testing.T) {
+		// given: Wi-Fi answered with a 1 s TTL
+		f := newMainloopFixture(t, cableClient(), true, 4)
+		f.send(f.answer(1, "192.168.1.62"), ifWifi)
+		f.next()
+		time.Sleep(1100 * time.Millisecond)
+
+		// when: the cable answers after the Wi-Fi answer expired
+		f.send(f.answer(3600, "fe80::62"), ifCable)
+
+		// then
+		if want := []string{"fe80::62%if31"}; !reflect.DeepEqual(addrStrings(f.next()), want) {
+			t.Errorf("want the cable address only")
+		}
+	})
+
+	t.Run("a newer answer on the same link replaces its addresses", func(t *testing.T) {
+		// given
+		f := newMainloopFixture(t, cableClient(), true, 4)
+		f.send(f.answer(3600, "fe80::1"), ifCable)
+		f.next()
+
+		// when
+		f.send(f.answer(3600, "fe80::2"), ifCable)
+
+		// then
+		if want := []string{"fe80::2%if31"}; !reflect.DeepEqual(addrStrings(f.next()), want) {
+			t.Errorf("want the replacement only")
+		}
+	})
+
+	t.Run("AAAA changes on an IPv4 link deliver nothing new", func(t *testing.T) {
+		// given
+		f := newMainloopFixture(t, cableClient(), true, 4)
+		f.send(f.answer(3600, "192.168.1.62", "2a0d::1"), ifWifi)
+		f.next()
+
+		// when
+		f.send(f.answer(3600, "192.168.1.62", "2a0d::2", "fe80::9"), ifWifi)
+		f.send(f.answer(3600, "192.168.1.62"), 5)
+
+		// then
+		f.none()
+	})
+
+	t.Run("without selected IPv6 links the first answer is final", func(t *testing.T) {
+		// given
+		f := newMainloopFixture(t, &client{}, true, 4)
+		f.send(f.answer(3600, "192.168.1.62"), ifWifi)
+		f.next()
+
+		// when
+		f.send(f.answer(3600, "192.168.1.63"), 5)
+		f.send(f.answer(3600, "fe80::62"), ifCable)
+
+		// then
+		f.none()
+	})
+}
+
+func TestLookupReturnsAfterItsFirstResult(t *testing.T) {
+	// given: a lookup with an unbuffered channel and two different answers
+	f := newMainloopFixture(t, cableClient(), false, 0)
+	f.send(f.answer(3600, "192.168.1.62"), ifWifi)
+	f.send(f.answer(3600, "fe80::62"), ifCable)
+
+	// when: the caller takes the first result and cancels
+	f.next()
+	time.Sleep(50 * time.Millisecond)
+	f.cancel()
+
+	// then
+	select {
+	case <-f.done:
+	case <-time.After(time.Second):
+		t.Fatal("mainloop did not return after cancellation")
+	}
+}
+
+func TestRecvLoopDropsUnselectedInterfaces(t *testing.T) {
+	// given
+	m := new(dns.Msg)
+	m.SetQuestion("_anytype._tcp.local.", dns.TypePTR)
+	packet, err := m.Pack()
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	from := []int{ifWifi, ifCable}
+	readFrom := func(b []byte) (int, int, error) {
+		if len(from) == 0 {
+			<-ctx.Done()
+			return 0, 0, net.ErrClosed
+		}
+		i := from[0]
+		from = from[1:]
+		return copy(b, packet), i, nil
+	}
+	msgCh := make(chan receivedMsg, 2)
+
+	// when
+	go recvLoop(ctx, readFrom, func(i int) bool { return i == ifCable }, msgCh)
+
+	// then
+	select {
+	case got := <-msgCh:
+		if got.ifIndex != ifCable {
+			t.Errorf("delivered a packet from interface %d", got.ifIndex)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("the selected interface's packet was dropped")
+	}
 }
 
 func TestRecvReportsTheReceivingInterface(t *testing.T) {

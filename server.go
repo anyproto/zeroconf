@@ -217,6 +217,8 @@ type Server struct {
 	writeTimeout   time.Duration
 	// linkLocalIfaces: see ServerLinkLocalIPv6
 	linkLocalIfaces map[int]struct{}
+	// ipv6Ifaces: see ServerSelectIPv6Ifaces; nil means all
+	ipv6Ifaces map[int]struct{}
 }
 
 // Constructs server structure
@@ -233,6 +235,7 @@ func newServer(ifaces []net.Interface, opts serverOpts) (*Server, error) {
 		writeTimeout:    opts.writeTimeout,
 		shouldShutdown:  make(chan struct{}),
 		linkLocalIfaces: opts.linkLocalIfaces,
+		ipv6Ifaces:      opts.ipv6Ifaces,
 	}
 
 	var err error
@@ -391,6 +394,13 @@ func (s *Server) recv6(c *ipv6.PacketConn) {
 			backoff = 0
 			if cm != nil {
 				ifIndex = cm.IfIndex
+			}
+			if s.ipv6Ifaces != nil {
+				// the wildcard socket also takes unicast queries on
+				// other links; answer only on the selected ones
+				if _, ok := s.ipv6Ifaces[ifIndex]; !ok {
+					continue
+				}
 			}
 			_ = s.parsePacket(buf[:n], ifIndex, from)
 		}
@@ -764,9 +774,8 @@ func (s *Server) appendAddrs(list []dns.RR, ttl uint32, ifIndex int, flushCache 
 	v4 := slices.Clip(s.service.AddrIPv4)
 	v6 := slices.Clip(s.service.AddrIPv6)
 	if len(v4) == 0 && len(v6) == 0 {
-		iface, _ := net.InterfaceByIndex(ifIndex)
-		if iface != nil {
-			a4, a6 := addrsForInterface(iface)
+		if addrs, err := interfaceAddrs(ifIndex); err == nil {
+			a4, a6 := splitAddrs(addrs)
 			v4 = append(v4, a4...)
 			if !linkLocal {
 				// a link-local interface announces its link-local only
@@ -850,9 +859,10 @@ func appendLinkLocal(v6 []net.IP, ifIndex int) []net.IP {
 	return v6
 }
 
-func addrsForInterface(iface *net.Interface) ([]net.IP, []net.IP) {
+// splitAddrs sorts an interface's addresses into IPv4 and IPv6, the IPv6
+// link-local ones only when it has no global address.
+func splitAddrs(addrs []net.Addr) ([]net.IP, []net.IP) {
 	var v4, v6, v6local []net.IP
-	addrs, _ := iface.Addrs()
 	for _, address := range addrs {
 		if ipnet, ok := address.(*net.IPNet); ok && !ipnet.IP.IsLoopback() {
 			if ipnet.IP.To4() != nil {

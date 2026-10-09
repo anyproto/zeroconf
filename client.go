@@ -9,7 +9,6 @@ import (
 	"net"
 	"net/netip"
 	"runtime"
-	"slices"
 	"strconv"
 	"strings"
 	"time"
@@ -42,6 +41,7 @@ type client struct {
 	ipv4conn     *ipv4.PacketConn
 	ipv6conn     *ipv6.PacketConn
 	interfaces   NetInterfaceList
+	ipv6Ifaces   map[int]struct{} // see SelectIPv6Ifaces; nil means all
 	writeTimeout time.Duration
 }
 
@@ -74,7 +74,10 @@ func SelectIfaces(ifaces []net.Interface) ClientOption {
 }
 
 // SelectIPv6Ifaces limits IPv6 traffic to the interfaces with these indexes,
-// out of those selected by SelectIfaces: IPv4 keeps using all of them.
+// out of those selected by SelectIfaces: IPv4 keeps using all of them. It also
+// makes a browser deliver an entry again when an answer on another interface
+// changes its IPv4 addresses or its link-local addresses on these interfaces
+// (see ifaceAddrs); otherwise an entry is delivered once per TTL.
 func SelectIPv6Ifaces(ifIndexes ...int) ClientOption {
 	return func(o *clientOpts) {
 		o.ipv6Ifaces = indexSet(ifIndexes)
@@ -207,6 +210,7 @@ func newClient(opts clientOpts) (*client, error) {
 		ipv4conn:     ipv4conn,
 		ipv6conn:     ipv6conn,
 		interfaces:   ifaceList,
+		ipv6Ifaces:   opts.ipv6Ifaces,
 		writeTimeout: opts.writeTimeout,
 	}, nil
 }
@@ -254,11 +258,29 @@ func (c *client) mainloop(ctx context.Context, params *lookupParams, msgCh <-cha
 	// Iterate through channels from listeners goroutines
 	var entries map[string]*ServiceEntry
 	sentEntries := make(map[string]*ServiceEntry)
+	merging := params.isBrowsing && len(c.ipv6Ifaces) > 0
+	byIface := ifaceAddrs{}
+	sentKeys := map[string]string{}
+	// send delivers e unless the context ends first: the subscriber may have
+	// stopped reading (a lookup takes its first result and cancels)
+	send := func(e *ServiceEntry) bool {
+		select {
+		case params.Entries <- e:
+			return true
+		case <-ctx.Done():
+			params.done()
+			c.shutdown()
+			return false
+		}
+	}
 
 	ticker := time.NewTicker(cleanupFreq)
 	defer ticker.Stop()
 	for {
-		var now time.Time
+		var (
+			now     time.Time
+			ifIndex int // interface the current message arrived on
+		)
 		select {
 		case <-ctx.Done():
 			// Context expired. Notify subscriber that we are done here.
@@ -269,11 +291,14 @@ func (c *client) mainloop(ctx context.Context, params *lookupParams, msgCh <-cha
 			for k, e := range sentEntries {
 				if t.After(e.Expiry) {
 					delete(sentEntries, k)
+					delete(byIface, k)
+					delete(sentKeys, k)
 				}
 			}
 			continue
 		case received := <-msgCh:
 			msg := received.msg
+			ifIndex = received.ifIndex
 			now = time.Now()
 			entries = make(map[string]*ServiceEntry)
 			sections := append(msg.Answer, msg.Ns...)
@@ -353,17 +378,19 @@ func (c *client) mainloop(ctx context.Context, params *lookupParams, msgCh <-cha
 				if !e.Expiry.After(now) {
 					delete(entries, k)
 					delete(sentEntries, k)
+					delete(byIface, k)
+					delete(sentKeys, k)
 					continue
 				}
-				if sent, ok := sentEntries[k]; ok {
-					// an answer on another interface may add addresses
-					// (a link-local one over a cable, IPv4 over Wi-Fi):
-					// deliver the union, once per change
-					merged, changed := mergeEntryAddrs(sent, e)
-					if !changed {
+				var key string
+				if merging {
+					byIface.update(k, ifIndex, e)
+					e, key = byIface.entry(k, e, now, c.ipv6Ifaces)
+				}
+				if _, ok := sentEntries[k]; ok {
+					if !merging || key == sentKeys[k] {
 						continue
 					}
-					e = merged
 				}
 
 				// If this is an DNS-SD query do not throw PTR away.
@@ -378,54 +405,17 @@ func (c *client) mainloop(ctx context.Context, params *lookupParams, msgCh <-cha
 				// Submit entry to subscriber and cache it.
 				// This is also a point to possibly stop probing actively for a
 				// service entry.
-				// the subscriber owns e once sent and may reorder its
-				// slices: keep a private copy to merge later answers into
-				sentEntries[k] = e.cloneAddrs()
-				params.Entries <- e
+				sentEntries[k] = e
+				sentKeys[k] = key
+				if !send(e) {
+					return
+				}
 				if !params.isBrowsing {
 					params.disableProbing()
 				}
 			}
 		}
 	}
-}
-
-// mergeEntryAddrs returns fresh with the addresses of an already delivered
-// entry in front, and whether fresh added any. Neither entry is modified: the
-// subscriber may still hold sent.
-func mergeEntryAddrs(sent, fresh *ServiceEntry) (*ServiceEntry, bool) {
-	merged := *fresh
-	var changed bool
-	merged.AddrIPv4, changed = unionIPs(sent.AddrIPv4, fresh.AddrIPv4, changed)
-	merged.AddrIPv6, changed = unionIPs(sent.AddrIPv6, fresh.AddrIPv6, changed)
-	merged.AddrIPv6Zoned = slices.Clone(sent.AddrIPv6Zoned)
-	for _, a := range fresh.AddrIPv6Zoned {
-		if !slices.Contains(merged.AddrIPv6Zoned, a) {
-			merged.AddrIPv6Zoned = append(merged.AddrIPv6Zoned, a)
-			changed = true
-		}
-	}
-	return &merged, changed
-}
-
-// cloneAddrs copies the entry with its own address slices.
-func (e *ServiceEntry) cloneAddrs() *ServiceEntry {
-	c := *e
-	c.AddrIPv4 = slices.Clone(e.AddrIPv4)
-	c.AddrIPv6 = slices.Clone(e.AddrIPv6)
-	c.AddrIPv6Zoned = slices.Clone(e.AddrIPv6Zoned)
-	return &c
-}
-
-func unionIPs(sent, fresh []net.IP, changed bool) ([]net.IP, bool) {
-	res := slices.Clone(sent)
-	for _, ip := range fresh {
-		if !slices.ContainsFunc(res, ip.Equal) {
-			res = append(res, ip)
-			changed = true
-		}
-	}
-	return res, changed
 }
 
 // Shutdown client will close currently open connections and channel implicitly.
@@ -470,7 +460,15 @@ func (c *client) recv(ctx context.Context, l interface{}, msgCh chan<- receivedM
 		return
 	}
 
-	recvLoop(ctx, readFrom, msgCh)
+	var accept func(ifIndex int) bool
+	if _, v6 := l.(*ipv6.PacketConn); v6 && c.ipv6Ifaces != nil {
+		// the wildcard socket also takes unicast answers on other links
+		accept = func(ifIndex int) bool {
+			_, ok := c.ipv6Ifaces[ifIndex]
+			return ok
+		}
+	}
+	recvLoop(ctx, readFrom, accept, msgCh)
 }
 
 // recvLoop reads packets via readFrom, unpacks them into dns.Msg structures
@@ -478,7 +476,7 @@ func (c *client) recv(ctx context.Context, l interface{}, msgCh chan<- receivedM
 // closed. Transient read errors are retried with a growing backoff (see
 // nextRecvBackoff), mirroring the server recv loops: a persistently erroring
 // socket must neither busy-spin a core nor silently kill reception.
-func recvLoop(ctx context.Context, readFrom func([]byte) (n int, ifIndex int, err error), msgCh chan<- receivedMsg) {
+func recvLoop(ctx context.Context, readFrom func([]byte) (n int, ifIndex int, err error), accept func(ifIndex int) bool, msgCh chan<- receivedMsg) {
 	buf := make([]byte, 65536)
 	var backoff time.Duration
 	for {
@@ -501,6 +499,9 @@ func recvLoop(ctx context.Context, readFrom func([]byte) (n int, ifIndex int, er
 			continue
 		}
 		backoff = 0
+		if accept != nil && !accept(ifIndex) {
+			continue
+		}
 		msg := new(dns.Msg)
 		if err := msg.Unpack(buf[:n]); err != nil {
 			// log.Printf("[WARN] mdns: Failed to unpack packet: %v", err)
