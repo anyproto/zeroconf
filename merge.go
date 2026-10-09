@@ -221,6 +221,15 @@ func (m ifaceAddrs) prune(now time.Time) {
 	}
 }
 
+// cachedTemplate is the last entry template handed out for the instance, to
+// tell it from an entry built from a packet's own service records.
+func (m ifaceAddrs) cachedTemplate(key string) *ServiceEntry {
+	if inst := m[key]; inst != nil {
+		return inst.cached
+	}
+	return nil
+}
+
 // usesLinkLocal reports whether the instance is delivered again on change,
 // see instanceAddrs.linkLocal.
 func (m ifaceAddrs) usesLinkLocal(key string) bool {

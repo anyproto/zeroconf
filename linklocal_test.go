@@ -711,6 +711,62 @@ func TestMainloopMergesAnswersFromSelectedLinks(t *testing.T) {
 		}
 	})
 
+	t.Run("a cable peer evicted from the cache is delivered again when it returns", func(t *testing.T) {
+		// given: delivered with a long service TTL, then renewed with short ones
+		origCleanup := cleanupFreq
+		cleanupFreq = 200 * time.Millisecond
+		t.Cleanup(func() { cleanupFreq = origCleanup })
+		f := newMainloopFixture(t, cableClient(), true, 4)
+		f.send(f.answerTTL(4500, 120, "fe80::62"), ifCable)
+		f.next()
+		f.send(f.answerTTL(1, 1, "fe80::62"), ifCable)
+		time.Sleep(1500 * time.Millisecond) // expired and evicted
+
+		// when
+		f.send(f.answer(3600, "fe80::62"), ifCable)
+
+		// then
+		if got, want := addrStrings(f.next()), []string{"fe80::62%if31"}; !reflect.DeepEqual(got, want) {
+			t.Errorf("got %v, want %v", got, want)
+		}
+	})
+
+	t.Run("a Wi-Fi peer's goodbye frees its next answer, as without a cable", func(t *testing.T) {
+		// given: a cable is selected; the peer answers on Wi-Fi, then Ethernet
+		f := newMainloopFixture(t, cableClient(), true, 4)
+		f.send(f.answer(3600, "192.168.1.62"), ifWifi)
+		f.next()
+		f.send(f.answer(3600, "10.0.0.62"), 5)
+
+		// when: it leaves Wi-Fi and answers on Ethernet again
+		f.send(f.answerTTL(0, 0, "192.168.1.62"), ifWifi)
+		f.send(f.answer(3600, "10.0.0.62"), 5)
+
+		// then
+		if got, want := addrStrings(f.next()), []string{"10.0.0.62"}; !reflect.DeepEqual(got, want) {
+			t.Errorf("got %v, want %v", got, want)
+		}
+	})
+
+	t.Run("a Wi-Fi peer gets the packet's own addresses, as without a cable", func(t *testing.T) {
+		// given: delivered, then its delivery expired
+		origCleanup := cleanupFreq
+		cleanupFreq = 200 * time.Millisecond
+		t.Cleanup(func() { cleanupFreq = origCleanup })
+		f := newMainloopFixture(t, cableClient(), true, 4)
+		f.send(f.answerTTL(1, 3600, "192.168.1.62"), ifWifi)
+		f.next()
+		time.Sleep(1500 * time.Millisecond)
+
+		// when: its address changed
+		f.send(flushed(f.answer(3600, "192.168.1.63")), ifWifi)
+
+		// then: not merged with the old one
+		if got, want := addrStrings(f.next()), []string{"192.168.1.63"}; !reflect.DeepEqual(got, want) {
+			t.Errorf("got %v, want %v", got, want)
+		}
+	})
+
 	t.Run("without selected IPv6 links the first answer is final", func(t *testing.T) {
 		// given
 		f := newMainloopFixture(t, &client{}, true, 4)
@@ -961,4 +1017,11 @@ func TestEnumerationIgnoresIPv6Selection(t *testing.T) {
 	}
 	cancel()
 	<-done
+}
+
+func TestInterfaceZoneIsTheIndex(t *testing.T) {
+	// a name would be resolved again at dial time, possibly to an old index
+	if got := interfaceZone(31); got != "31" {
+		t.Errorf("zone = %q, want the decimal index", got)
+	}
 }

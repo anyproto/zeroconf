@@ -235,12 +235,10 @@ type receivedMsg struct {
 }
 
 // interfaceZone names the interface a link-local address is reached through:
-// its name, or the decimal index when the name is unknown. net.Dial accepts
-// both. A var so tests can stub the lookup.
+// its decimal index. A name would be resolved again at dial time through Go's
+// interface cache, which can still map it to the old index for up to a
+// minute after a cable is plugged back in. A var so tests can stub it.
 var interfaceZone = func(ifIndex int) string {
-	if iface, err := net.InterfaceByIndex(ifIndex); err == nil && iface.Name != "" {
-		return iface.Name
-	}
 	return strconv.Itoa(ifIndex)
 }
 
@@ -316,7 +314,7 @@ func (c *client) mainloop(ctx context.Context, params *lookupParams, msgCh <-cha
 			// delivered again
 			if merging {
 				for k, delivered := range sentKeys {
-					if byIface.usesLinkLocal(k) && byIface.currentKey(k, t, c.ipv6Ifaces) != delivered {
+					if byIface.currentKey(k, t, c.ipv6Ifaces) != delivered {
 						delete(sentEntries, k)
 						delete(sentKeys, k)
 					}
@@ -442,30 +440,47 @@ func (c *client) mainloop(ctx context.Context, params *lookupParams, msgCh <-cha
 		if len(entries) > 0 {
 			for k, e := range entries {
 				var key string
+				linkLocalPeer := false
 				if merging {
-					if delivered, sent := sentKeys[k]; sent && byIface.usesLinkLocal(k) &&
-						byIface.currentKey(k, now, c.ipv6Ifaces) != delivered {
-						// some of what was delivered expired (the cleanup
-						// tick may not have run yet): a peer coming back
-						// unchanged is news
+					if delivered, sent := sentKeys[k]; sent && byIface.currentKey(k, now, c.ipv6Ifaces) != delivered {
+						// some of what was delivered expired, or the cache
+						// evicted the instance (the cleanup tick may not
+						// have run yet): a peer coming back unchanged is news
 						delete(sentEntries, k)
 						delete(sentKeys, k)
 					}
+					fromPacket := e != byIface.cachedTemplate(k)
 					byIface.update(k, ifIndex, e, records[k], now)
 					merged, mergedKey, ok := byIface.entry(k, e, now, c.ipv6Ifaces)
-					if !ok {
-						if !e.Expiry.After(now) || byIface.usesLinkLocal(k) {
-							// a goodbye on the last link, or nothing
-							// left to dial
+					linkLocalPeer = ok && byIface.usesLinkLocal(k)
+					if linkLocalPeer {
+						if _, sent := sentEntries[k]; sent && mergedKey == sentKeys[k] {
+							continue
+						}
+						e, key = merged, mergedKey
+					} else {
+						// never seen over a selected link: exactly as
+						// without merging, on this packet's own entry; the
+						// cache above only watches for a cable answer
+						if !ok && byIface.usesLinkLocal(k) {
+							// a cable peer with nothing left to dial
 							delete(sentEntries, k)
 							delete(sentKeys, k)
+							continue
 						}
-						continue
+						if !fromPacket {
+							continue
+						}
+						if !e.Expiry.After(now) {
+							delete(entries, k)
+							delete(sentEntries, k)
+							delete(sentKeys, k)
+							continue
+						}
+						if _, sent := sentEntries[k]; sent {
+							continue
+						}
 					}
-					if _, sent := sentEntries[k]; sent && (mergedKey == sentKeys[k] || !byIface.usesLinkLocal(k)) {
-						continue
-					}
-					e, key = merged, mergedKey
 				} else {
 					if !e.Expiry.After(now) {
 						delete(entries, k)
@@ -490,7 +505,7 @@ func (c *client) mainloop(ctx context.Context, params *lookupParams, msgCh <-cha
 				// This is also a point to possibly stop probing actively for a
 				// service entry.
 				sentEntries[k] = e
-				if merging {
+				if linkLocalPeer {
 					sentKeys[k] = key
 				}
 				if !send(e) {
