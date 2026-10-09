@@ -95,6 +95,11 @@ type instanceAddrs struct {
 	text      []string
 	expiry    time.Time
 	tmpl      *ServiceEntry // the instance's service record, see template
+	// serviceLinks are the links whose service records are live: after
+	// the last one says goodbye, an address record alone (the host may
+	// still answer for other services) must not revive the instance
+	serviceLinks map[int]struct{}
+	cached       *ServiceEntry // the last entry template handed out
 }
 
 type ifaceAddrs map[string]*instanceAddrs
@@ -109,7 +114,15 @@ func (m ifaceAddrs) update(key string, ifIndex int, fresh *ServiceEntry, addrs *
 	}
 	if !fresh.Expiry.After(now) {
 		delete(inst.links, ifIndex)
+		delete(inst.serviceLinks, ifIndex)
 		return
+	}
+	if fresh != inst.cached {
+		// service records of this packet, not a template of ours
+		if inst.serviceLinks == nil {
+			inst.serviceLinks = map[int]struct{}{}
+		}
+		inst.serviceLinks[ifIndex] = struct{}{}
 	}
 	inst.expiry = fresh.Expiry
 	if inst.tmpl == nil {
@@ -140,7 +153,7 @@ func (m ifaceAddrs) update(key string, ifIndex int, fresh *ServiceEntry, addrs *
 // the instance's resolved target, so its address records can be matched.
 func (m ifaceAddrs) fillTarget(key string, e *ServiceEntry, now time.Time) {
 	inst := m[key]
-	if e.HostName != "" || inst == nil || inst.port == 0 || !inst.expiry.After(now) {
+	if e.HostName != "" || inst == nil || inst.port == 0 || !inst.expiry.After(now) || len(inst.serviceLinks) == 0 {
 		return
 	}
 	e.HostName, e.Port = inst.host, inst.port
@@ -151,12 +164,13 @@ func (m ifaceAddrs) fillTarget(key string, e *ServiceEntry, now time.Time) {
 // announcement, a renewal of the address alone); nil when none is known.
 func (m ifaceAddrs) template(key, hostName string, now time.Time) *ServiceEntry {
 	inst := m[key]
-	if inst == nil || inst.tmpl == nil || inst.host != hostName || !inst.expiry.After(now) {
+	if inst == nil || inst.tmpl == nil || inst.host != hostName || !inst.expiry.After(now) || len(inst.serviceLinks) == 0 {
 		return nil
 	}
 	e := *inst.tmpl
 	e.HostName, e.Port, e.Text, e.Expiry = inst.host, inst.port, inst.text, inst.expiry
 	e.AddrIPv4, e.AddrIPv6, e.AddrIPv6Zoned = nil, nil, nil
+	inst.cached = &e
 	return &e
 }
 

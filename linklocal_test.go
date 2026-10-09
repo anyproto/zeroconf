@@ -498,6 +498,25 @@ func TestMainloopMergesAnswersFromSelectedLinks(t *testing.T) {
 		f.none()
 	})
 
+	t.Run("an address alone does not revive a withdrawn service", func(t *testing.T) {
+		// given: the service said goodbye on its only link
+		f := newMainloopFixture(t, cableClient(), true, 4)
+		f.send(f.answer(3600, "fe80::62"), ifCable)
+		f.next()
+		goodbye := f.answer(0)
+		goodbye.Extra = goodbye.Extra[:1]
+		f.send(goodbye, ifCable)
+
+		// when: the host still answers for its address (other services)
+		bare := new(dns.Msg)
+		bare.Response = true
+		bare.Answer = []dns.RR{&dns.AAAA{Hdr: dns.RR_Header{Name: f.host, Rrtype: dns.TypeAAAA, Class: dns.ClassINET, Ttl: 120}, AAAA: net.ParseIP("fe80::62")}}
+		f.send(bare, ifCable)
+
+		// then
+		f.none()
+	})
+
 	t.Run("a cold split announcement resolves", func(t *testing.T) {
 		// given: PTR and SRV first, nothing known yet
 		f := newMainloopFixture(t, cableClient(), true, 4)
@@ -749,24 +768,61 @@ func loopbackInterface(t *testing.T) net.Interface {
 }
 
 func TestJoinUdp6MulticastOnlySelected(t *testing.T) {
-	// given: every multicast interface, but IPv6 selected on none / on one
-	list := NewInterfaceList(listMulticastInterfaces())
-	if len(list) == 0 {
-		t.Skip("no multicast interfaces")
-	}
+	ifaces := listMulticastInterfaces()
 
-	// when: nothing selected
-	_, err := joinUdp6Multicast(list, map[int]struct{}{})
-
-	// then
-	if err == nil {
-		t.Fatal("joined IPv6 with no interface selected")
-	}
-	for _, iface := range list {
-		if iface.HasFlag(NetInterfaceScopeIPv6, NetInterfaceStateFlagMulticastJoined) {
-			t.Errorf("%s joined although not selected", iface.Name)
+	t.Run("nothing selected joins nothing", func(t *testing.T) {
+		list := NewInterfaceList(ifaces)
+		if len(list) == 0 {
+			t.Skip("no multicast interfaces")
 		}
-	}
+
+		_, err := joinUdp6Multicast(list, map[int]struct{}{})
+
+		if err == nil {
+			t.Fatal("joined IPv6 with no interface selected")
+		}
+		for _, iface := range list {
+			if iface.HasFlag(NetInterfaceScopeIPv6, NetInterfaceStateFlagMulticastJoined) {
+				t.Errorf("%s joined although not selected", iface.Name)
+			}
+		}
+	})
+
+	t.Run("one selected joins only that one", func(t *testing.T) {
+		// given: the first interface IPv6 can join, out of several
+		list := NewInterfaceList(ifaces)
+		if len(list) < 2 {
+			t.Skip("needs two multicast interfaces")
+		}
+		probe, err := joinUdp6Multicast(NewInterfaceList(ifaces), nil)
+		if err != nil {
+			t.Skipf("no IPv6 multicast here: %v", err)
+		}
+		probe.Close()
+		var selected int
+		for _, iface := range list {
+			if c, err := joinUdp6Multicast(NewInterfaceList([]net.Interface{iface.Interface}), nil); err == nil {
+				c.Close()
+				selected = iface.Index
+				break
+			}
+		}
+
+		// when
+		conn, err := joinUdp6Multicast(list, map[int]struct{}{selected: {}})
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer conn.Close()
+
+		// then
+		for _, iface := range list {
+			joined := iface.HasFlag(NetInterfaceScopeIPv6, NetInterfaceStateFlagMulticastJoined)
+			if joined != (iface.Index == selected) {
+				t.Errorf("%s joined=%v, selected=%v", iface.Name, joined, iface.Index == selected)
+			}
+		}
+	})
 }
 
 func TestEnumerationIgnoresIPv6Selection(t *testing.T) {
