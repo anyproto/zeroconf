@@ -67,7 +67,7 @@ func TestRecvLoopSurvivesTransientReadErrors(t *testing.T) {
 	done := make(chan struct{})
 	go func() {
 		defer close(done)
-		recvLoop(ctx, readFrom, nil, msgCh)
+		recvLoop(ctx, readFrom, false, nil, msgCh)
 	}()
 
 	select {
@@ -95,7 +95,7 @@ func TestRecvLoopStopsOnClosedConn(t *testing.T) {
 	done := make(chan struct{})
 	go func() {
 		defer close(done)
-		recvLoop(ctx, readFrom, nil, make(chan receivedMsg, 1))
+		recvLoop(ctx, readFrom, false, nil, make(chan receivedMsg, 1))
 	}()
 
 	select {

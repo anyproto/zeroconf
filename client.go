@@ -74,10 +74,10 @@ func SelectIfaces(ifaces []net.Interface) ClientOption {
 }
 
 // SelectIPv6Ifaces limits IPv6 traffic to the interfaces with these indexes,
-// out of those selected by SelectIfaces: IPv4 keeps using all of them. It also
-// makes a browser deliver an entry again when an answer on another interface
-// changes its IPv4 addresses or its link-local addresses on these interfaces
-// (see ifaceAddrs); otherwise an entry is delivered once per TTL.
+// out of those selected by SelectIfaces: IPv4 keeps using all of them. What
+// arrives over IPv6 on one of them is delivered as an entry of its own (see
+// ServiceEntry.LinkIndex), apart from the once-per-TTL entry of every other
+// answer, and again on a later answer there once two minutes have passed.
 func SelectIPv6Ifaces(ifIndexes ...int) ClientOption {
 	return func(o *clientOpts) {
 		o.ipv6Ifaces = indexSet(ifIndexes)
@@ -217,21 +217,19 @@ func newClient(opts clientOpts) (*client, error) {
 
 var cleanupFreq = 10 * time.Second
 
-// hasTarget reports whether an entry of this packet resolved to hostName.
-func hasTarget(entries map[string]*ServiceEntry, hostName string) bool {
-	for _, e := range entries {
-		if e.HostName == hostName {
-			return true
-		}
-	}
-	return false
-}
+// linkRedelivery is how long the delivery of an answer on a selected IPv6
+// interface (see SelectIPv6Ifaces) holds back the next one from that link,
+// so a subscriber hears again from a peer that keeps answering there. 120 s
+// is the address TTL of RFC 6762 §10. A var so tests can shorten it.
+var linkRedelivery = 120 * time.Second
 
 // receivedMsg is a decoded packet with the index of the interface it arrived
-// on (0 when the platform does not report it).
+// on (0 when the platform does not report it). v6 says it came from the IPv6
+// socket.
 type receivedMsg struct {
 	msg     *dns.Msg
 	ifIndex int
+	v6      bool
 }
 
 // interfaceZone names the interface a link-local address is reached through:
@@ -262,16 +260,11 @@ func zonedIPv6(ip net.IP, ifIndex int) (netip.Addr, bool) {
 
 // Start listeners and waits for the shutdown signal from exit channel
 func (c *client) mainloop(ctx context.Context, params *lookupParams, msgCh <-chan receivedMsg) {
-
 	// Iterate through channels from listeners goroutines
 	var entries map[string]*ServiceEntry
 	sentEntries := make(map[string]*ServiceEntry)
-	// not for service type enumeration, whose PTR-only results have no
-	// target or address to merge
-	merging := params.isBrowsing && len(c.ipv6Ifaces) > 0 &&
-		params.ServiceRecord.ServiceTypeName() != params.ServiceRecord.ServiceName()
-	byIface := ifaceAddrs{}
-	sentKeys := map[string]string{}
+	// service type enumeration lists types, which belong to no link
+	enumeration := params.ServiceRecord.ServiceTypeName() == params.ServiceRecord.ServiceName()
 	// send delivers e unless the context ends first: the subscriber may have
 	// stopped reading (a lookup takes its first result and cancels)
 	send := func(e *ServiceEntry) bool {
@@ -289,9 +282,8 @@ func (c *client) mainloop(ctx context.Context, params *lookupParams, msgCh <-cha
 	defer ticker.Stop()
 	for {
 		var (
-			now     time.Time
-			ifIndex int                     // interface the current message arrived on
-			records map[string]*answerAddrs // its address records per instance
+			now       time.Time
+			linkIndex int // see ServiceEntry.LinkIndex
 		)
 		select {
 		case <-ctx.Done():
@@ -303,28 +295,20 @@ func (c *client) mainloop(ctx context.Context, params *lookupParams, msgCh <-cha
 			for k, e := range sentEntries {
 				if t.After(e.Expiry) {
 					delete(sentEntries, k)
-					delete(sentKeys, k)
-				}
-			}
-			// address records expire on their own TTLs, not on the
-			// last delivery's
-			byIface.prune(t)
-			// an instance some of whose delivered addresses expired may
-			// come back unchanged: forget its delivery so that is
-			// delivered again
-			if merging {
-				for k, delivered := range sentKeys {
-					if byIface.currentKey(k, t, c.ipv6Ifaces) != delivered {
-						delete(sentEntries, k)
-						delete(sentKeys, k)
-					}
 				}
 			}
 			continue
 		case received := <-msgCh:
 			msg := received.msg
-			ifIndex = received.ifIndex
 			now = time.Now()
+			// a packet from the IPv6 socket on a selected interface is a
+			// delivery stream of its own, so an answer over Wi-Fi does not
+			// hide the one over the cable, nor the other way round
+			if received.v6 && !enumeration {
+				if _, ok := c.ipv6Ifaces[received.ifIndex]; ok {
+					linkIndex = received.ifIndex
+				}
+			}
 			entries = make(map[string]*ServiceEntry)
 			sections := append(msg.Answer, msg.Ns...)
 			sections = append(sections, msg.Extra...)
@@ -377,49 +361,6 @@ func (c *client) mainloop(ctx context.Context, params *lookupParams, msgCh <-cha
 				}
 			}
 			// Associate IPs in a second round as other fields should be filled by now.
-			records = make(map[string]*answerAddrs)
-			addRecord := func(k string, ip net.IP, hdr dns.RR_Header) {
-				if records[k] == nil {
-					records[k] = &answerAddrs{}
-				}
-				records[k].add(ip, ifIndex, hdr, now)
-			}
-			if merging {
-				// address records without their service records in this
-				// packet belong to the instances already resolved to
-				// that target
-				for _, answer := range sections {
-					var name string
-					switch rr := answer.(type) {
-					case *dns.A:
-						name = rr.Hdr.Name
-					case *dns.AAAA:
-						name = rr.Hdr.Name
-					default:
-						continue
-					}
-					if hasTarget(entries, name) {
-						continue
-					}
-					for k := range byIface {
-						if _, ok := entries[k]; ok {
-							continue
-						}
-						if tmpl := byIface.template(k, name, ifIndex, now); tmpl != nil {
-							entries[k] = tmpl
-						}
-					}
-				}
-			}
-			// the merge cache matches address records to a partial entry's
-			// resolved target too; the entry keeps only its own (see target)
-			targets := make(map[string]string, len(entries))
-			for k, e := range entries {
-				targets[k] = e.HostName
-				if merging {
-					targets[k] = byIface.target(k, e, now)
-				}
-			}
 			for _, answer := range sections {
 				switch rr := answer.(type) {
 				case *dns.A:
@@ -427,20 +368,14 @@ func (c *client) mainloop(ctx context.Context, params *lookupParams, msgCh <-cha
 						if e.HostName == rr.Hdr.Name {
 							entries[k].AddrIPv4 = append(entries[k].AddrIPv4, rr.A)
 						}
-						if targets[k] == rr.Hdr.Name {
-							addRecord(k, rr.A, rr.Hdr)
-						}
 					}
 				case *dns.AAAA:
 					for k, e := range entries {
 						if e.HostName == rr.Hdr.Name {
 							entries[k].AddrIPv6 = append(entries[k].AddrIPv6, rr.AAAA)
-							if zoned, ok := zonedIPv6(rr.AAAA, ifIndex); ok {
+							if zoned, ok := zonedIPv6(rr.AAAA, received.ifIndex); ok {
 								entries[k].AddrIPv6Zoned = append(entries[k].AddrIPv6Zoned, zoned)
 							}
-						}
-						if targets[k] == rr.Hdr.Name {
-							addRecord(k, rr.AAAA, rr.Hdr)
 						}
 					}
 				}
@@ -449,78 +384,43 @@ func (c *client) mainloop(ctx context.Context, params *lookupParams, msgCh <-cha
 
 		if len(entries) > 0 {
 			for k, e := range entries {
-				var key string
-				linkLocalPeer := false
-				if merging {
-					if delivered, sent := sentKeys[k]; sent && byIface.currentKey(k, now, c.ipv6Ifaces) != delivered {
-						// some of what was delivered expired, or the cache
-						// evicted the instance (the cleanup tick may not
-						// have run yet): a peer coming back unchanged is news
-						delete(sentEntries, k)
-						delete(sentKeys, k)
-					}
-					fromPacket := e != byIface.cachedTemplate(k)
-					byIface.update(k, ifIndex, e, records[k], now)
-					merged, mergedKey, ok := byIface.entry(k, e, now, c.ipv6Ifaces)
-					linkLocalPeer = ok && byIface.usesLinkLocal(k)
-					if linkLocalPeer {
-						if _, sent := sentEntries[k]; sent && mergedKey == sentKeys[k] {
-							continue
-						}
-						e, key = merged, mergedKey
-					} else {
-						// never seen over a selected link: exactly as
-						// without merging, on this packet's own entry; the
-						// cache above only watches for a cable answer
-						if !ok && byIface.usesLinkLocal(k) {
-							// a cable peer with nothing left to dial
-							delete(sentEntries, k)
-							delete(sentKeys, k)
-							continue
-						}
-						if !fromPacket {
-							continue
-						}
-						if !e.Expiry.After(now) {
-							delete(entries, k)
-							delete(sentEntries, k)
-							delete(sentKeys, k)
-							continue
-						}
-						if _, sent := sentEntries[k]; sent {
-							continue
-						}
-					}
-				} else {
-					if !e.Expiry.After(now) {
-						delete(entries, k)
-						delete(sentEntries, k)
-						continue
-					}
-					if _, ok := sentEntries[k]; ok {
-						continue
-					}
+				key := k
+				if linkIndex != 0 {
+					key = k + "|v6:" + strconv.Itoa(linkIndex)
+				}
+				if !e.Expiry.After(now) {
+					delete(entries, k)
+					delete(sentEntries, key)
+					continue
+				}
+				if _, ok := sentEntries[key]; ok {
+					continue
 				}
 
 				// If this is an DNS-SD query do not throw PTR away.
 				// It is expected to have only PTR for enumeration
-				if params.ServiceRecord.ServiceTypeName() != params.ServiceRecord.ServiceName() {
+				if !enumeration {
 					// Require at least one resolved IP address for ServiceEntry
 					// TODO: wait some more time as chances are high both will arrive.
 					if len(e.AddrIPv4) == 0 && len(e.AddrIPv6) == 0 {
 						continue
 					}
 				}
+				if linkIndex != 0 {
+					e.LinkIndex = linkIndex
+					// held back no longer than linkRedelivery, so the link
+					// is delivered again while the peer keeps answering on it
+					if limit := now.Add(linkRedelivery); e.Expiry.After(limit) {
+						e.Expiry = limit
+					}
+				}
 				// Submit entry to subscriber and cache it.
 				// This is also a point to possibly stop probing actively for a
 				// service entry.
-				sentEntries[k] = e
-				if linkLocalPeer {
-					sentKeys[k] = key
-				}
 				if !send(e) {
 					return
 				}
+				sentEntries[key] = e
 				if !params.isBrowsing {
 					params.disableProbing()
 				}
@@ -572,22 +472,25 @@ func (c *client) recv(ctx context.Context, l interface{}, msgCh chan<- receivedM
 	}
 
 	var accept func(ifIndex int) bool
-	if _, v6 := l.(*ipv6.PacketConn); v6 && c.ipv6Ifaces != nil {
+	_, v6 := l.(*ipv6.PacketConn)
+	if v6 && c.ipv6Ifaces != nil {
 		// the wildcard socket also takes unicast answers on other links
 		accept = func(ifIndex int) bool {
 			_, ok := c.ipv6Ifaces[ifIndex]
 			return ok
 		}
 	}
-	recvLoop(ctx, readFrom, accept, msgCh)
+	recvLoop(ctx, readFrom, v6, accept, msgCh)
 }
 
 // recvLoop reads packets via readFrom, unpacks them into dns.Msg structures
 // and forwards them to msgCh until ctx is canceled or the connection is
 // closed. Transient read errors are retried with a growing backoff (see
 // nextRecvBackoff), mirroring the server recv loops: a persistently erroring
-// socket must neither busy-spin a core nor silently kill reception.
-func recvLoop(ctx context.Context, readFrom func([]byte) (n int, ifIndex int, err error), accept func(ifIndex int) bool, msgCh chan<- receivedMsg) {
+// socket must neither busy-spin a core nor silently kill reception. v6 marks
+// the packets as read from the IPv6 socket; accept, when set, drops those
+// from other interfaces.
+func recvLoop(ctx context.Context, readFrom func([]byte) (n int, ifIndex int, err error), v6 bool, accept func(ifIndex int) bool, msgCh chan<- receivedMsg) {
 	buf := make([]byte, 65536)
 	var backoff time.Duration
 	for {
@@ -619,7 +522,7 @@ func recvLoop(ctx context.Context, readFrom func([]byte) (n int, ifIndex int, er
 			continue
 		}
 		select {
-		case msgCh <- receivedMsg{msg: msg, ifIndex: ifIndex}:
+		case msgCh <- receivedMsg{msg: msg, ifIndex: ifIndex, v6: v6}:
 			// Submit decoded DNS message and continue.
 		case <-ctx.Done():
 			// Abort.

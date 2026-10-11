@@ -78,19 +78,14 @@ func ServerSelectIPTraffic(t IPType) ServerOption {
 
 // ServerLinkLocalIPv6 makes an answer sent on one of the listed interfaces
 // carry that interface's own IPv6 link-local addresses, on top of the fixed
-// address list of RegisterProxy. A link-local address is only reachable
-// through its own link, so it is never announced on another interface.
+// address list of RegisterProxy, and limits IPv6 traffic to them: IPv4 keeps
+// using every interface the server registered on. A link-local address is
+// only reachable through its own link, so it is never announced on another
+// interface.
 func ServerLinkLocalIPv6(ifIndexes ...int) ServerOption {
 	return func(o *serverOpts) {
 		o.linkLocalIfaces = indexSet(ifIndexes)
-	}
-}
-
-// ServerSelectIPv6Ifaces limits IPv6 traffic to the interfaces with these
-// indexes: IPv4 keeps using every interface the server registered on.
-func ServerSelectIPv6Ifaces(ifIndexes ...int) ServerOption {
-	return func(o *serverOpts) {
-		o.ipv6Ifaces = indexSet(ifIndexes)
+		o.ipv6Ifaces = o.linkLocalIfaces
 	}
 }
 
@@ -217,7 +212,7 @@ type Server struct {
 	writeTimeout   time.Duration
 	// linkLocalIfaces: see ServerLinkLocalIPv6
 	linkLocalIfaces map[int]struct{}
-	// ipv6Ifaces: see ServerSelectIPv6Ifaces; nil means all
+	// ipv6Ifaces: see ServerLinkLocalIPv6; nil means all
 	ipv6Ifaces map[int]struct{}
 }
 
@@ -972,7 +967,7 @@ func (s *Server) multicastResponse(msg *dns.Msg, ifIndex int, requiredFlags ...N
 		// See https://pkg.go.dev/golang.org/x/net/ipv6#pkg-note-BUG
 		// As of Golang 1.18.4
 		// On Windows, the ControlMessage for ReadFrom and WriteTo methods of PacketConn is not implemented.
-		// IPv6 goes only where the group was joined (see ServerSelectIPv6Ifaces)
+		// IPv6 goes only where the group was joined (see ServerLinkLocalIPv6)
 		requiredFlags := append([]NetInterfaceStateFlag{NetInterfaceStateFlagMulticastJoined}, requiredFlags...)
 		var wcm ipv6.ControlMessage
 		if ifIndex != 0 {
