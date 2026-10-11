@@ -550,6 +550,39 @@ func TestLinkLocalServerOptionLimitsIPv6ToItsInterfaces(t *testing.T) {
 		}
 	})
 
+	t.Run("IPv6 multicast goes only where the group was joined", func(t *testing.T) {
+		// given: a server whose interface list holds the loopback
+		lo := loopbackInterface(t)
+		pConn, _ := loopbackConn(t, "udp6")
+		serverOn := func(joined bool) *Server {
+			s := &Server{ipv6conn: pConn.(*ipv6.PacketConn), interfaces: NewInterfaceList([]net.Interface{lo})}
+			if joined {
+				s.interfaces[0].SetFlag(NetInterfaceScopeIPv6, NetInterfaceStateFlagMulticastJoined)
+			}
+			return s
+		}
+		sent := func(s *Server) bool {
+			return s.interfaces[0].HasFlag(NetInterfaceScopeIPv6, NetInterfaceStateFlagMessageSent)
+		}
+		msg := serviceAnswer("_anytype._tcp.local.", "peer1._anytype._tcp.local.", "peer1.local.", 120, "192.0.2.1")
+		for _, ifIndex := range []int{lo.Index, 0} {
+			if s := serverOn(true); s.multicastResponse(msg, ifIndex) != nil || !sent(s) {
+				t.Skipf("cannot send IPv6 multicast over the loopback (ifIndex %d)", ifIndex)
+			}
+		}
+
+		// when: a reply on that interface, and an announcement to all
+		for _, ifIndex := range []int{lo.Index, 0} {
+			s := serverOn(false)
+			_ = s.multicastResponse(msg, ifIndex)
+
+			// then
+			if sent(s) {
+				t.Errorf("ifIndex %d: sent over an interface whose group was not joined", ifIndex)
+			}
+		}
+	})
+
 	lo := loopbackInterface(t)
 	for _, tc := range []struct {
 		name     string
@@ -661,6 +694,45 @@ func TestIPv4OnlyEntriesKeepTheirTTLAndDedup(t *testing.T) {
 		// then: as on develop
 		f.none()
 	})
+}
+
+func TestIPv4OnlyEntriesComeBackAfterTheCleanupTick(t *testing.T) {
+	for _, tc := range []struct {
+		name   string
+		client func() *client
+	}{
+		{"without a selection", func() *client { return &client{} }},
+		{"with a cable selected", cableClient},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			// given: a 1 s service TTL and a fast cleanup tick
+			origCleanup := cleanupFreq
+			cleanupFreq = 20 * time.Millisecond
+			t.Cleanup(func() { cleanupFreq = origCleanup })
+			f := newMainloopFixture(t, tc.client(), true, 4)
+			f.send(f.answer(1, "192.168.1.62"), ifWifi)
+			f.next()
+
+			// when: the same answer keeps coming
+			// then: delivered again once its TTL ran out and a tick
+			// dropped the delivery; until then held back
+			deadline := time.Now().Add(2 * time.Second)
+			for {
+				f.send(f.answer(1, "192.168.1.62"), ifWifi)
+				select {
+				case e := <-f.entries:
+					if e.Instance != "peer1" {
+						t.Fatalf("delivered %s", e.Instance)
+					}
+					return
+				case <-time.After(20 * time.Millisecond):
+				}
+				if time.Now().After(deadline) {
+					t.Fatal("not delivered again after its TTL and a cleanup tick")
+				}
+			}
+		})
+	}
 }
 
 func TestIPv4OnlyBrowsingKeepsDeliveriesAcrossCleanup(t *testing.T) {
@@ -823,6 +895,88 @@ func TestRecvReportsTheReceivingInterface(t *testing.T) {
 				t.Fatal("no packet received")
 			}
 		})
+	}
+}
+
+func TestRecvReportsTheInterfaceThroughTheProductionJoin(t *testing.T) {
+	lo := loopbackInterface(t)
+	for _, tc := range []struct {
+		network string
+		traffic IPType
+	}{
+		{"udp4", IPv4},
+		{"udp6", IPv6},
+	} {
+		t.Run(tc.network, func(t *testing.T) {
+			// given: a client joined over the loopback by newClient, the
+			// loopback selected for IPv6
+			c, err := newClient(applyOpts(SelectIPTraffic(tc.traffic), SelectIfaces([]net.Interface{lo}), SelectIPv6Ifaces(lo.Index)))
+			if err != nil {
+				t.Skipf("cannot join over the loopback: %v", err)
+			}
+			defer c.shutdown()
+			ctx, cancel := context.WithCancel(context.Background())
+			defer cancel()
+			msgCh := make(chan receivedMsg, 16)
+			if tc.traffic == IPv4 {
+				go c.recv(ctx, c.ipv4conn, msgCh)
+			} else {
+				go c.recv(ctx, c.ipv6conn, msgCh)
+			}
+
+			// when: a query to the mDNS group over the loopback
+			name := "_probe" + strconv.FormatInt(time.Now().UnixNano(), 10) + "._tcp.local."
+			query := new(dns.Msg)
+			query.SetQuestion(name, dns.TypePTR)
+			sendMulticast(t, tc.network, lo, query)
+
+			// then: received with the loopback as its interface
+			timeout := time.After(2 * time.Second)
+			for {
+				select {
+				case got := <-msgCh:
+					if len(got.msg.Question) == 0 || got.msg.Question[0].Name != name {
+						continue // other mDNS traffic
+					}
+					if got.ifIndex != lo.Index {
+						t.Errorf("ifIndex = %d, want the loopback interface %d", got.ifIndex, lo.Index)
+					}
+					return
+				case <-timeout:
+					t.Fatal("the query was not received")
+				}
+			}
+		})
+	}
+}
+
+// sendMulticast sends msg to the mDNS group over iface.
+func sendMulticast(t *testing.T, network string, iface net.Interface, msg *dns.Msg) {
+	t.Helper()
+	packet, err := msg.Pack()
+	if err != nil {
+		t.Fatal(err)
+	}
+	conn, err := net.ListenUDP(network, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Close()
+	if network == "udp6" {
+		p := ipv6.NewPacketConn(conn)
+		if err := p.SetMulticastInterface(&iface); err != nil {
+			t.Skipf("no IPv6 multicast over %s: %v", iface.Name, err)
+		}
+		_, err = p.WriteTo(packet, nil, ipv6Addr)
+	} else {
+		p := ipv4.NewPacketConn(conn)
+		if err := p.SetMulticastInterface(&iface); err != nil {
+			t.Skipf("no IPv4 multicast over %s: %v", iface.Name, err)
+		}
+		_, err = p.WriteTo(packet, nil, ipv4Addr)
+	}
+	if err != nil {
+		t.Skipf("cannot send multicast over %s: %v", iface.Name, err)
 	}
 }
 
