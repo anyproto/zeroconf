@@ -9,6 +9,7 @@ import (
 	"net"
 	"net/netip"
 	"runtime"
+	"slices"
 	"strconv"
 	"strings"
 	"time"
@@ -74,10 +75,11 @@ func SelectIfaces(ifaces []net.Interface) ClientOption {
 }
 
 // SelectIPv6Ifaces limits IPv6 traffic to the interfaces with these indexes,
-// out of those selected by SelectIfaces: IPv4 keeps using all of them. What
-// arrives over IPv6 on one of them is delivered as an entry of its own (see
-// ServiceEntry.LinkIndex), apart from the once-per-TTL entry of every other
-// answer, and again on a later answer there once two minutes have passed.
+// out of those selected by SelectIfaces: IPv4 keeps using all of them. An
+// answer over IPv6 on one of them that has a link-local address there is
+// delivered as an entry of its own (see ServiceEntry.LinkIndex), apart from
+// the once-per-TTL entry of every other answer, and again on a later answer
+// there once two minutes have passed.
 func SelectIPv6Ifaces(ifIndexes ...int) ClientOption {
 	return func(o *clientOpts) {
 		o.ipv6Ifaces = indexSet(ifIndexes)
@@ -268,6 +270,10 @@ func zonedIPv6(ip net.IP, ifIndex int) (netip.Addr, bool) {
 	return addr.WithZone(interfaceZone(ifIndex)), true
 }
 
+func isZonedLinkLocal(a netip.Addr) bool {
+	return a.IsLinkLocalUnicast() && a.Zone() != ""
+}
+
 // Start listeners and waits for the shutdown signal from exit channel
 func (c *client) mainloop(ctx context.Context, callerDone <-chan struct{}, params *lookupParams, msgCh <-chan receivedMsg) {
 	// Iterate through channels from listeners goroutines
@@ -419,6 +425,11 @@ func (c *client) mainloop(ctx context.Context, callerDone <-chan struct{}, param
 					if len(e.AddrIPv4) == 0 && len(e.AddrIPv6) == 0 {
 						continue
 					}
+				}
+				if linkIndex != 0 && !slices.ContainsFunc(e.AddrIPv6Zoned, isZonedLinkLocal) {
+					// nothing to dial on the link (an A-only answer, say):
+					// it must not hold back the next answer there
+					continue
 				}
 				if linkIndex != 0 {
 					e.LinkIndex = linkIndex

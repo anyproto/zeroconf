@@ -446,6 +446,37 @@ func TestMainloopDeliversEachCableSeparately(t *testing.T) {
 		f.none()
 	})
 
+	t.Run("a cable answer without link-local takes no slot", func(t *testing.T) {
+		// given: the phone's cable also has 169.254, and an A-only answer comes first
+		f := newMainloopFixture(t, cableClient(), true, 4)
+		f.send6(f.answer(3600, "169.254.104.250"), ifCable)
+
+		// when
+		f.send6(f.answer(3600, "fe80::62"), ifCable)
+
+		// then
+		e := f.next()
+		if e.LinkIndex != ifCable {
+			t.Errorf("LinkIndex = %d, want %d", e.LinkIndex, ifCable)
+		}
+		if want := []netip.Addr{netip.MustParseAddr("fe80::62%if31")}; !reflect.DeepEqual(e.AddrIPv6Zoned, want) {
+			t.Errorf("AddrIPv6Zoned = %v, want %v", e.AddrIPv6Zoned, want)
+		}
+	})
+
+	for _, addr := range []string{"169.254.104.250", "2a0d::5"} {
+		t.Run("a cable answer with only "+addr+" is not delivered", func(t *testing.T) {
+			// given
+			f := newMainloopFixture(t, cableClient(), true, 4)
+
+			// when
+			f.send6(f.answer(3600, addr), ifCable)
+
+			// then
+			f.none()
+		})
+	}
+
 	t.Run("two cables are independent", func(t *testing.T) {
 		// given
 		f := newMainloopFixture(t, &client{ipv6Ifaces: indexSet([]int{ifCable, ifCable2})}, true, 4)

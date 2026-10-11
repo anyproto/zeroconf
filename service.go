@@ -118,8 +118,9 @@ type ServiceEntry struct {
 	AddrIPv6Zoned []netip.Addr `json:"-"`
 	// LinkIndex is the interface an IPv6 answer arrived on when that
 	// interface was selected with SelectIPv6Ifaces; 0 otherwise. Such an
-	// entry describes that link only: answers on other links are
-	// delivered on their own.
+	// entry describes that link only and has at least one zoned link-local
+	// address in AddrIPv6Zoned: answers on other links are delivered on
+	// their own.
 	LinkIndex int `json:"-"`
 }
 
