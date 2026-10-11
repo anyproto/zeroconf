@@ -154,6 +154,8 @@ func applyOpts(options ...ClientOption) clientOpts {
 }
 
 func (c *client) run(ctx context.Context, params *lookupParams) error {
+	// a delivery gives up only when the caller cancels, see mainloop
+	callerDone := ctx.Done()
 	ctx, cancel := context.WithCancel(ctx)
 	// start listening for responses
 	msgCh := make(chan receivedMsg, 32)
@@ -166,7 +168,7 @@ func (c *client) run(ctx context.Context, params *lookupParams) error {
 	done := make(chan struct{})
 	go func() {
 		defer close(done)
-		c.mainloop(ctx, params, msgCh)
+		c.mainloop(ctx, callerDone, params, msgCh)
 	}()
 
 	// If previous probe was ok, it should be fine now. In case of an error later on,
@@ -202,8 +204,9 @@ func newClient(opts clientOpts) (*client, error) {
 	if (opts.listenOn & IPv6) > 0 {
 		ipv6conn, err6 = joinUdp6Multicast(ifaceList, opts.ipv6Ifaces)
 	}
-	if ipv4conn == nil && ipv6conn == nil {
-		return nil, errors.Join(err4, err6)
+	// with no family selected at all the client has no socket, as before
+	if err := errors.Join(err4, err6); ipv4conn == nil && ipv6conn == nil && err != nil {
+		return nil, err
 	}
 
 	return &client{
@@ -259,19 +262,20 @@ func zonedIPv6(ip net.IP, ifIndex int) (netip.Addr, bool) {
 }
 
 // Start listeners and waits for the shutdown signal from exit channel
-func (c *client) mainloop(ctx context.Context, params *lookupParams, msgCh <-chan receivedMsg) {
+func (c *client) mainloop(ctx context.Context, callerDone <-chan struct{}, params *lookupParams, msgCh <-chan receivedMsg) {
 	// Iterate through channels from listeners goroutines
 	var entries map[string]*ServiceEntry
 	sentEntries := make(map[string]*ServiceEntry)
 	// service type enumeration lists types, which belong to no link
 	enumeration := params.ServiceRecord.ServiceTypeName() == params.ServiceRecord.ServiceName()
-	// send delivers e unless the context ends first: the subscriber may have
-	// stopped reading (a lookup takes its first result and cancels)
+	// send delivers e unless the caller cancels first: the subscriber may
+	// have stopped reading (a lookup takes its first result and cancels).
+	// The end of probing (ctx) does not cut a packet short, as on develop.
 	send := func(e *ServiceEntry) bool {
 		select {
 		case params.Entries <- e:
 			return true
-		case <-ctx.Done():
+		case <-callerDone:
 			params.done()
 			c.shutdown()
 			return false
@@ -393,7 +397,10 @@ func (c *client) mainloop(ctx context.Context, params *lookupParams, msgCh <-cha
 					delete(sentEntries, key)
 					continue
 				}
-				if _, ok := sentEntries[key]; ok {
+				// an expired delivery for a link stops holding its answers
+				// back at once; for the instance key it waits for the
+				// cleanup tick, as it always did
+				if sent, ok := sentEntries[key]; ok && (linkIndex == 0 || sent.Expiry.After(now)) {
 					continue
 				}
 

@@ -5,6 +5,7 @@ import (
 	"net"
 	"net/netip"
 	"reflect"
+	"slices"
 	"strconv"
 	"testing"
 	"time"
@@ -186,7 +187,7 @@ func TestMainloopZonesLinkLocalByReceivingInterface(t *testing.T) {
 			done := make(chan struct{})
 			go func() {
 				defer close(done)
-				(&client{}).mainloop(ctx, params, msgCh)
+				(&client{}).mainloop(ctx, ctx.Done(), params, msgCh)
 			}()
 
 			// when
@@ -221,6 +222,7 @@ type mainloopFixture struct {
 	done     chan struct{}
 	instance string
 	host     string
+	markers  int
 }
 
 func newMainloopFixture(t *testing.T, cl *client, browsing bool, entriesBuf int) *mainloopFixture {
@@ -245,7 +247,7 @@ func newMainloopFixture(t *testing.T, cl *client, browsing bool, entriesBuf int)
 	}
 	go func() {
 		defer close(f.done)
-		cl.mainloop(ctx, params, f.msgCh)
+		cl.mainloop(ctx, ctx.Done(), params, f.msgCh)
 	}()
 	// stop the loop before the zone stub is restored (cleanups run LIFO)
 	t.Cleanup(func() {
@@ -258,19 +260,28 @@ func newMainloopFixture(t *testing.T, cl *client, browsing bool, entriesBuf int)
 // answer is a service answer with a service TTL and the given address
 // records (TTL 120, as the server sends them).
 func (f *mainloopFixture) answer(ttl uint32, addrs ...string) *dns.Msg {
+	return serviceAnswer(f.params.ServiceName(), f.instance, f.host, ttl, addrs...)
+}
+
+// serviceAnswer is one instance's PTR, SRV and address records.
+func serviceAnswer(serviceName, instance, host string, ttl uint32, addrs ...string) *dns.Msg {
 	msg := new(dns.Msg)
 	msg.Response = true
-	msg.Answer = []dns.RR{&dns.PTR{Hdr: dns.RR_Header{Name: f.params.ServiceName(), Rrtype: dns.TypePTR, Class: dns.ClassINET, Ttl: ttl}, Ptr: f.instance}}
-	msg.Extra = []dns.RR{&dns.SRV{Hdr: dns.RR_Header{Name: f.instance, Rrtype: dns.TypeSRV, Class: dns.ClassINET, Ttl: ttl}, Port: 4006, Target: f.host}}
+	appendInstance(msg, serviceName, instance, host, ttl, addrs...)
+	return msg
+}
+
+func appendInstance(msg *dns.Msg, serviceName, instance, host string, ttl uint32, addrs ...string) {
+	msg.Answer = append(msg.Answer, &dns.PTR{Hdr: dns.RR_Header{Name: serviceName, Rrtype: dns.TypePTR, Class: dns.ClassINET, Ttl: ttl}, Ptr: instance})
+	msg.Extra = append(msg.Extra, &dns.SRV{Hdr: dns.RR_Header{Name: instance, Rrtype: dns.TypeSRV, Class: dns.ClassINET, Ttl: ttl}, Port: 4006, Target: host})
 	for _, a := range addrs {
 		ip := net.ParseIP(a)
 		if ip.To4() != nil {
-			msg.Extra = append(msg.Extra, &dns.A{Hdr: dns.RR_Header{Name: f.host, Rrtype: dns.TypeA, Class: dns.ClassINET, Ttl: 120}, A: ip})
+			msg.Extra = append(msg.Extra, &dns.A{Hdr: dns.RR_Header{Name: host, Rrtype: dns.TypeA, Class: dns.ClassINET, Ttl: 120}, A: ip})
 		} else {
-			msg.Extra = append(msg.Extra, &dns.AAAA{Hdr: dns.RR_Header{Name: f.host, Rrtype: dns.TypeAAAA, Class: dns.ClassINET, Ttl: 120}, AAAA: ip})
+			msg.Extra = append(msg.Extra, &dns.AAAA{Hdr: dns.RR_Header{Name: host, Rrtype: dns.TypeAAAA, Class: dns.ClassINET, Ttl: 120}, AAAA: ip})
 		}
 	}
-	return msg
 }
 
 // send feeds a packet from the IPv4 socket, send6 one from the IPv6 socket.
@@ -293,12 +304,15 @@ func (f *mainloopFixture) next() *ServiceEntry {
 	}
 }
 
+// none asserts that nothing sent so far is delivered: packets are handled
+// in order, so a new instance sent after them must be the next delivery.
 func (f *mainloopFixture) none() {
 	f.t.Helper()
-	select {
-	case e := <-f.entries:
-		f.t.Errorf("unexpected delivery: %v %v on link %d", e.AddrIPv4, e.AddrIPv6Zoned, e.LinkIndex)
-	case <-time.After(100 * time.Millisecond):
+	f.markers++
+	marker := "marker" + strconv.Itoa(f.markers)
+	f.send(serviceAnswer(f.params.ServiceName(), marker+"."+f.params.ServiceName(), marker+".local.", 3600, "192.0.2.1"), ifWifi)
+	if e := f.next(); e.Instance != marker {
+		f.t.Errorf("unexpected delivery: %s %v %v on link %d", e.Instance, e.AddrIPv4, e.AddrIPv6Zoned, e.LinkIndex)
 	}
 }
 
@@ -373,9 +387,9 @@ func TestMainloopDeliversEachCableSeparately(t *testing.T) {
 		// when
 		f.send6(f.answer(3600, "fe80::1"), ifCable)
 
-		// then
-		if d := time.Until(e.Expiry) - linkRedelivery; d < -2*time.Second || d > 2*time.Second {
-			t.Errorf("expires in %v, want %v", time.Until(e.Expiry), linkRedelivery)
+		// then: held back for the address TTL of RFC 6762 10
+		if d := time.Until(e.Expiry) - 120*time.Second; d < -2*time.Second || d > 2*time.Second {
+			t.Errorf("expires in %v, want 2m0s", time.Until(e.Expiry))
 		}
 		f.none()
 	})
@@ -393,15 +407,14 @@ func TestMainloopDeliversEachCableSeparately(t *testing.T) {
 		}
 	})
 
-	t.Run("a cable answer is delivered again once the cap expired", func(t *testing.T) {
-		// given
+	t.Run("the first cable answer after the cap is delivered again", func(t *testing.T) {
+		// given: the cap elapses at once, and no cleanup tick runs
 		origCleanup, origCap := cleanupFreq, linkRedelivery
-		cleanupFreq, linkRedelivery = 50*time.Millisecond, 100*time.Millisecond
+		cleanupFreq, linkRedelivery = time.Hour, 0
 		t.Cleanup(func() { cleanupFreq, linkRedelivery = origCleanup, origCap })
 		f := newMainloopFixture(t, cableClient(), true, 4)
 		f.send6(f.answer(3600, "fe80::1"), ifCable)
 		f.next()
-		time.Sleep(300 * time.Millisecond) // past the cap plus a cleanup tick
 
 		// when
 		f.send6(f.answer(3600, "fe80::1"), ifCable)
@@ -491,6 +504,52 @@ func TestLinkLocalServerOptionLimitsIPv6ToItsInterfaces(t *testing.T) {
 	}
 }
 
+func TestIPv4OnlyEntriesKeepTheirTTLAndDedup(t *testing.T) {
+	for _, tc := range []struct {
+		name   string
+		client func() *client
+	}{
+		{"without a selection", func() *client { return &client{} }},
+		{"with a cable selected", cableClient},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			// given: the link cap elapses at once
+			origCap := linkRedelivery
+			linkRedelivery = 0
+			t.Cleanup(func() { linkRedelivery = origCap })
+			f := newMainloopFixture(t, tc.client(), true, 4)
+			f.send(f.answer(3600, "192.168.1.62"), ifWifi)
+			e := f.next()
+
+			// when
+			f.send(f.answer(3600, "192.168.1.62"), ifWifi)
+
+			// then: its own service TTL, and suppressed for it
+			if d := time.Until(e.Expiry) - time.Hour; d < -2*time.Second || d > 2*time.Second {
+				t.Errorf("expires in %v, want 1h0m0s", time.Until(e.Expiry))
+			}
+			f.none()
+		})
+	}
+
+	t.Run("an expired delivery holds back answers until the cleanup tick", func(t *testing.T) {
+		// given: a cable selected, a 1 s service TTL, no cleanup tick
+		origCleanup := cleanupFreq
+		cleanupFreq = time.Hour
+		t.Cleanup(func() { cleanupFreq = origCleanup })
+		f := newMainloopFixture(t, cableClient(), true, 4)
+		f.send(f.answer(1, "192.168.1.62"), ifWifi)
+		f.next()
+		time.Sleep(1100 * time.Millisecond) // at least, a longer pause changes nothing
+
+		// when
+		f.send(f.answer(1, "192.168.1.62"), ifWifi)
+
+		// then: as on develop
+		f.none()
+	})
+}
+
 func TestIPv4OnlyBrowsingKeepsDeliveriesAcrossCleanup(t *testing.T) {
 	// given: no IPv6 selection, a delivered peer, a cleanup tick
 	origCleanup := cleanupFreq
@@ -525,6 +584,57 @@ func TestLookupReturnsAfterItsFirstResult(t *testing.T) {
 	case <-f.done:
 	case <-time.After(time.Second):
 		t.Fatal("mainloop did not return after cancellation")
+	}
+}
+
+func TestLookupDeliversItsWholeFirstPacket(t *testing.T) {
+	// given: a lookup over a real socket, and one answer listing ten instances
+	pConn, addr := loopbackConn(t, "udp4")
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	params := defaultParams("_anytype._tcp")
+	entries := make(chan *ServiceEntry)
+	params.Entries = entries
+	var runErr error
+	runDone := make(chan struct{})
+	go func() {
+		defer close(runDone)
+		runErr = (&client{ipv4conn: pConn.(*ipv4.PacketConn)}).run(ctx, params)
+	}()
+	msg := new(dns.Msg)
+	msg.Response = true
+	var want []string
+	for i := range 10 {
+		name := "peer" + strconv.Itoa(i)
+		appendInstance(msg, params.ServiceName(), name+"."+params.ServiceName(), name+".local.", 3600, "192.0.2."+strconv.Itoa(i+1))
+		want = append(want, name)
+	}
+
+	// when: the subscriber is slow after the first result, which ends probing
+	sendTo(t, "udp4", addr, msg)
+	var got []string
+	select {
+	case e := <-entries:
+		got = append(got, e.Instance)
+	case <-ctx.Done():
+		t.Fatal("no entry delivered")
+	}
+	select {
+	case <-runDone: // run gave up on the rest
+	case <-time.After(200 * time.Millisecond):
+	}
+	for e := range entries {
+		got = append(got, e.Instance)
+	}
+
+	// then
+	slices.Sort(got)
+	if !reflect.DeepEqual(got, want) {
+		t.Errorf("delivered %v, want %v", got, want)
+	}
+	<-runDone
+	if runErr != nil {
+		t.Errorf("run = %v", runErr)
 	}
 }
 
@@ -571,50 +681,21 @@ func TestRecvReportsTheReceivingInterface(t *testing.T) {
 	lo := loopbackInterface(t)
 	for _, tc := range []struct {
 		network string
-		ip      net.IP
-		conn    func(*net.UDPConn) (interface{}, func() error, error)
 		v6      bool
 	}{
-		{"udp4", net.IPv4(127, 0, 0, 1), func(c *net.UDPConn) (interface{}, func() error, error) {
-			p := ipv4.NewPacketConn(c)
-			return p, p.Close, p.SetControlMessage(ipv4.FlagInterface, true)
-		}, false},
-		{"udp6", net.IPv6loopback, func(c *net.UDPConn) (interface{}, func() error, error) {
-			p := ipv6.NewPacketConn(c)
-			return p, p.Close, p.SetControlMessage(ipv6.FlagInterface, true)
-		}, true},
+		{"udp4", false},
+		{"udp6", true},
 	} {
 		t.Run(tc.network, func(t *testing.T) {
 			// given: a real socket with control messages, as the client sets it up
-			conn, err := net.ListenUDP(tc.network, &net.UDPAddr{IP: tc.ip})
-			if err != nil {
-				t.Skipf("no %s loopback: %v", tc.network, err)
-			}
-			pConn, closeConn, err := tc.conn(conn)
-			if err != nil {
-				t.Skipf("no control messages here: %v", err)
-			}
-			defer closeConn()
+			pConn, addr := loopbackConn(t, tc.network)
 			ctx, cancel := context.WithCancel(context.Background())
 			defer cancel()
 			msgCh := make(chan receivedMsg, 1)
 			go (&client{}).recv(ctx, pConn, msgCh)
 
 			// when
-			m := new(dns.Msg)
-			m.SetQuestion("_anytype._tcp.local.", dns.TypePTR)
-			packet, err := m.Pack()
-			if err != nil {
-				t.Fatal(err)
-			}
-			sender, err := net.DialUDP(tc.network, nil, conn.LocalAddr().(*net.UDPAddr))
-			if err != nil {
-				t.Fatal(err)
-			}
-			defer sender.Close()
-			if _, err := sender.Write(packet); err != nil {
-				t.Fatal(err)
-			}
+			sendTo(t, tc.network, addr, ptrQuery())
 
 			// then
 			select {
@@ -630,6 +711,97 @@ func TestRecvReportsTheReceivingInterface(t *testing.T) {
 			}
 		})
 	}
+}
+
+func TestRecvFiltersIPv6BySelection(t *testing.T) {
+	lo := loopbackInterface(t)
+	elsewhere := lo.Index + 1000
+	for _, tc := range []struct {
+		name     string
+		network  string
+		selected int
+		kept     bool
+	}{
+		{"IPv6 over a selected interface is kept", "udp6", lo.Index, true},
+		{"IPv6 over another interface is dropped", "udp6", elsewhere, false},
+		{"IPv4 is not filtered", "udp4", elsewhere, true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			// given
+			pConn, addr := loopbackConn(t, tc.network)
+			ctx, cancel := context.WithCancel(context.Background())
+			defer cancel()
+			msgCh := make(chan receivedMsg, 1)
+			go (&client{ipv6Ifaces: indexSet([]int{tc.selected})}).recv(ctx, pConn, msgCh)
+
+			// when
+			sendTo(t, tc.network, addr, ptrQuery())
+
+			// then: a dropped packet can only be waited for
+			wait := 2 * time.Second
+			if !tc.kept {
+				wait = 300 * time.Millisecond
+			}
+			select {
+			case <-msgCh:
+				if !tc.kept {
+					t.Error("delivered a packet from an unselected interface")
+				}
+			case <-time.After(wait):
+				if tc.kept {
+					t.Error("the packet was dropped")
+				}
+			}
+		})
+	}
+}
+
+// loopbackConn is a loopback socket set up as the client sets up its own,
+// reporting the receiving interface.
+func loopbackConn(t *testing.T, network string) (pConn interface{}, addr *net.UDPAddr) {
+	t.Helper()
+	ip := net.IPv4(127, 0, 0, 1)
+	if network == "udp6" {
+		ip = net.IPv6loopback
+	}
+	conn, err := net.ListenUDP(network, &net.UDPAddr{IP: ip})
+	if err != nil {
+		t.Skipf("no %s loopback: %v", network, err)
+	}
+	t.Cleanup(func() { conn.Close() })
+	if network == "udp6" {
+		p := ipv6.NewPacketConn(conn)
+		pConn, err = p, p.SetControlMessage(ipv6.FlagInterface, true)
+	} else {
+		p := ipv4.NewPacketConn(conn)
+		pConn, err = p, p.SetControlMessage(ipv4.FlagInterface, true)
+	}
+	if err != nil {
+		t.Skipf("no control messages here: %v", err)
+	}
+	return pConn, conn.LocalAddr().(*net.UDPAddr)
+}
+
+func sendTo(t *testing.T, network string, addr *net.UDPAddr, msg *dns.Msg) {
+	t.Helper()
+	packet, err := msg.Pack()
+	if err != nil {
+		t.Fatal(err)
+	}
+	sender, err := net.DialUDP(network, nil, addr)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer sender.Close()
+	if _, err := sender.Write(packet); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func ptrQuery() *dns.Msg {
+	m := new(dns.Msg)
+	m.SetQuestion("_anytype._tcp.local.", dns.TypePTR)
+	return m
 }
 
 func loopbackInterface(t *testing.T) net.Interface {
@@ -703,6 +875,94 @@ func TestJoinUdp6MulticastOnlySelected(t *testing.T) {
 			}
 		}
 	})
+
+	t.Run("a client joins only its selected one", func(t *testing.T) {
+		// given: two interfaces IPv6 can join on their own
+		var joinable []net.Interface
+		for _, iface := range ifaces {
+			if c, err := joinUdp6Multicast(NewInterfaceList([]net.Interface{iface}), nil); err == nil {
+				c.Close()
+				joinable = append(joinable, iface)
+			}
+		}
+		if len(joinable) < 2 {
+			t.Skip("needs two interfaces with IPv6 multicast")
+		}
+		selected := joinable[0].Index
+
+		// when
+		c, err := newClient(applyOpts(SelectIPTraffic(IPv6), SelectIfaces(joinable), SelectIPv6Ifaces(selected)))
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer c.shutdown()
+
+		// then
+		for _, iface := range c.interfaces {
+			joined := iface.HasFlag(NetInterfaceScopeIPv6, NetInterfaceStateFlagMulticastJoined)
+			if joined != (iface.Index == selected) {
+				t.Errorf("%s joined=%v, selected=%v", iface.Name, joined, iface.Index == selected)
+			}
+		}
+	})
+}
+
+func TestLinkSelectionReachesTheClient(t *testing.T) {
+	t.Run("the option selects", func(t *testing.T) {
+		// when: no IP family, so no socket is needed
+		c, err := newClient(applyOpts(SelectIPTraffic(0), SelectIPv6Ifaces(ifCable, ifCable2)))
+
+		// then
+		if err != nil || c == nil {
+			t.Fatalf("newClient = %v, %v", c, err)
+		}
+		if want := indexSet([]int{ifCable, ifCable2}); !reflect.DeepEqual(c.ipv6Ifaces, want) {
+			t.Errorf("selection = %v, want %v", c.ipv6Ifaces, want)
+		}
+	})
+
+	t.Run("without the option nothing is selected", func(t *testing.T) {
+		// when
+		c, err := newClient(applyOpts(SelectIPTraffic(0)))
+
+		// then: IPv6 goes everywhere, as before
+		if err != nil || c == nil {
+			t.Fatalf("newClient = %v, %v", c, err)
+		}
+		if c.ipv6Ifaces != nil {
+			t.Errorf("selection = %v, want none", c.ipv6Ifaces)
+		}
+	})
+}
+
+func TestJoinNoFamilyKeepsBrowsingSocketless(t *testing.T) {
+	// given
+	ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
+	defer cancel()
+	entries := make(chan *ServiceEntry)
+
+	// when: no IP family at all
+	err := Browse(ctx, "_anytype._tcp", "local.", entries, SelectIPTraffic(0))
+
+	// then: browsed without sockets until the end, as on develop
+	if err != nil {
+		t.Errorf("Browse = %v", err)
+	}
+	if _, open := <-entries; open {
+		t.Error("entries not closed")
+	}
+}
+
+func TestJoinFailureOfEveryRequestedFamilyIsAnError(t *testing.T) {
+	for _, traffic := range []IPType{IPv4, IPv6, IPv4AndIPv6} {
+		// when
+		c, err := newClient(applyOpts(SelectIPTraffic(traffic), SelectIfaces(unjoinableIfaces)))
+
+		// then
+		if err == nil || c != nil {
+			t.Errorf("traffic %d: newClient = %v, %v, want an error", traffic, c, err)
+		}
+	}
 }
 
 func TestEnumerationIgnoresIPv6Selection(t *testing.T) {
@@ -710,14 +970,14 @@ func TestEnumerationIgnoresIPv6Selection(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 	defer cancel()
 	params := defaultParams("_services._dns-sd._udp")
-	entries := make(chan *ServiceEntry, 2)
+	entries := make(chan *ServiceEntry, 3)
 	params.Entries = entries
 	params.isBrowsing = true
-	msgCh := make(chan receivedMsg, 2)
+	msgCh := make(chan receivedMsg, 3)
 	done := make(chan struct{})
 	go func() {
 		defer close(done)
-		cableClient().mainloop(ctx, params, msgCh)
+		cableClient().mainloop(ctx, ctx.Done(), params, msgCh)
 	}()
 
 	// when: the same type over the cable's IPv6 socket, then over IPv4
@@ -727,19 +987,20 @@ func TestEnumerationIgnoresIPv6Selection(t *testing.T) {
 	msgCh <- receivedMsg{msg: msg, ifIndex: ifCable, v6: true}
 	msgCh <- receivedMsg{msg: msg, ifIndex: ifWifi}
 
-	// then: delivered once, for no link
-	select {
-	case e := <-entries:
-		if e.LinkIndex != 0 {
-			t.Errorf("LinkIndex = %d, want 0", e.LinkIndex)
+	marker := msg.Copy()
+	marker.Answer[0].(*dns.PTR).Ptr = "_marker._tcp.local."
+	msgCh <- receivedMsg{msg: marker, ifIndex: ifWifi}
+
+	// then: delivered once, for no link; the marker type comes next
+	for _, want := range []string{"_anytype._tcp.local", "_marker._tcp.local"} {
+		select {
+		case e := <-entries:
+			if e.Instance != want || e.LinkIndex != 0 {
+				t.Errorf("delivered %s on link %d, want %s on none", e.Instance, e.LinkIndex, want)
+			}
+		case <-ctx.Done():
+			t.Fatalf("%s was not delivered", want)
 		}
-	case <-ctx.Done():
-		t.Fatal("the enumeration result was not delivered")
-	}
-	select {
-	case e := <-entries:
-		t.Errorf("delivered again, on link %d", e.LinkIndex)
-	case <-time.After(100 * time.Millisecond):
 	}
 	cancel()
 	<-done
