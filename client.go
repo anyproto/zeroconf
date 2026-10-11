@@ -184,6 +184,13 @@ func defaultParams(service string) *lookupParams {
 	return newLookupParams("", service, "local", false, make(chan *ServiceEntry))
 }
 
+// joinIPv4 and joinIPv6 join the multicast groups for newClient, vars so
+// tests can make one family fail.
+var (
+	joinIPv4 = joinUdp4Multicast
+	joinIPv6 = joinUdp6Multicast
+)
+
 // Client structure constructor
 func newClient(opts clientOpts) (*client, error) {
 	ifaces := opts.ifaces
@@ -197,12 +204,12 @@ func newClient(opts clientOpts) (*client, error) {
 	// IPv4 interfaces
 	var ipv4conn *ipv4.PacketConn
 	if (opts.listenOn & IPv4) > 0 {
-		ipv4conn, err4 = joinUdp4Multicast(ifaceList)
+		ipv4conn, err4 = joinIPv4(ifaceList)
 	}
 	// IPv6 interfaces
 	var ipv6conn *ipv6.PacketConn
 	if (opts.listenOn & IPv6) > 0 {
-		ipv6conn, err6 = joinUdp6Multicast(ifaceList, opts.ipv6Ifaces)
+		ipv6conn, err6 = joinIPv6(ifaceList, opts.ipv6Ifaces)
 	}
 	// with no family selected at all the client has no socket, as before
 	if err := errors.Join(err4, err6); ipv4conn == nil && ipv6conn == nil && err != nil {

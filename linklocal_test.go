@@ -2,6 +2,7 @@ package zeroconf
 
 import (
 	"context"
+	"errors"
 	"net"
 	"net/netip"
 	"reflect"
@@ -459,6 +460,26 @@ func TestMainloopDeliversEachCableSeparately(t *testing.T) {
 		}
 	})
 
+	t.Run("two peers on one cable are independent", func(t *testing.T) {
+		// given
+		f := newMainloopFixture(t, cableClient(), true, 4)
+		other := func() *dns.Msg {
+			return serviceAnswer(f.params.ServiceName(), "peer2."+f.params.ServiceName(), "peer2.local.", 3600, "fe80::2")
+		}
+
+		// when
+		f.send6(f.answer(3600, "fe80::1"), ifCable)
+		f.send6(other(), ifCable)
+
+		// then: both delivered, then each one's repeat held back
+		if got, want := []string{f.next().Instance, f.next().Instance}, []string{"peer1", "peer2"}; !reflect.DeepEqual(got, want) {
+			t.Errorf("delivered %v, want %v", got, want)
+		}
+		f.send6(f.answer(3600, "fe80::1"), ifCable)
+		f.send6(other(), ifCable)
+		f.none()
+	})
+
 	t.Run("without a selection IPv6 packets use the instance key", func(t *testing.T) {
 		// given
 		f := newMainloopFixture(t, &client{}, true, 4)
@@ -491,16 +512,108 @@ func TestMainloopDeliversEachCableSeparately(t *testing.T) {
 }
 
 func TestLinkLocalServerOptionLimitsIPv6ToItsInterfaces(t *testing.T) {
-	// when
-	opts := applyServerOpts(ServerLinkLocalIPv6(ifCable, ifCable2))
+	t.Run("the option selects", func(t *testing.T) {
+		// when
+		opts := applyServerOpts(ServerLinkLocalIPv6(ifCable, ifCable2))
 
-	// then: answers there carry their own link-local, and IPv6 goes nowhere else
-	want := indexSet([]int{ifCable, ifCable2})
-	if !reflect.DeepEqual(opts.linkLocalIfaces, want) {
-		t.Errorf("link-local interfaces = %v, want %v", opts.linkLocalIfaces, want)
-	}
-	if !reflect.DeepEqual(opts.ipv6Ifaces, want) {
-		t.Errorf("IPv6 interfaces = %v, want %v", opts.ipv6Ifaces, want)
+		// then: answers there carry their own link-local, and IPv6 goes nowhere else
+		want := indexSet([]int{ifCable, ifCable2})
+		if !reflect.DeepEqual(opts.linkLocalIfaces, want) {
+			t.Errorf("link-local interfaces = %v, want %v", opts.linkLocalIfaces, want)
+		}
+		if !reflect.DeepEqual(opts.ipv6Ifaces, want) {
+			t.Errorf("IPv6 interfaces = %v, want %v", opts.ipv6Ifaces, want)
+		}
+	})
+
+	t.Run("a server joins only the selected one", func(t *testing.T) {
+		// given
+		joinable := ipv6JoinableIfaces(t)
+		selected := joinable[0].Index
+
+		// when
+		s, err := newServer(joinable, applyServerOpts(ServerSelectIPTraffic(IPv6), ServerLinkLocalIPv6(selected)))
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer s.ipv6conn.Close()
+
+		// then
+		if want := indexSet([]int{selected}); !reflect.DeepEqual(s.ipv6Ifaces, want) {
+			t.Errorf("IPv6 interfaces = %v, want %v", s.ipv6Ifaces, want)
+		}
+		for _, iface := range s.interfaces {
+			joined := iface.HasFlag(NetInterfaceScopeIPv6, NetInterfaceStateFlagMulticastJoined)
+			if joined != (iface.Index == selected) {
+				t.Errorf("%s joined=%v, selected=%v", iface.Name, joined, iface.Index == selected)
+			}
+		}
+	})
+
+	lo := loopbackInterface(t)
+	for _, tc := range []struct {
+		name     string
+		selected []int
+		answered bool
+	}{
+		{"a query over a selected interface is answered", []int{lo.Index}, true},
+		{"a query over another interface is not", []int{lo.Index + 1000}, false},
+		{"without a selection every interface is answered", nil, true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			// given: a server reading a loopback socket, as recv6 reads its own
+			pConn, addr := loopbackConn(t, "udp6")
+			s := &Server{
+				service:        newServiceEntry("peer1", "_anytype._tcp", "local"),
+				ipv6conn:       pConn.(*ipv6.PacketConn),
+				ttl:            120,
+				shouldShutdown: make(chan struct{}),
+			}
+			s.service.HostName, s.service.Port = "peer1.local.", 4006
+			s.service.AddrIPv4 = []net.IP{net.ParseIP("192.0.2.1")}
+			if tc.selected != nil {
+				opts := applyServerOpts(ServerLinkLocalIPv6(tc.selected...))
+				s.linkLocalIfaces, s.ipv6Ifaces = opts.linkLocalIfaces, opts.ipv6Ifaces
+			}
+			stubInterfaceAddrs(t, nil) // no link-local of the loopback in the answer
+			s.refCount.Add(1)
+			go s.recv6(s.ipv6conn)
+			t.Cleanup(func() {
+				close(s.shouldShutdown)
+				s.ipv6conn.Close()
+				s.refCount.Wait()
+			})
+			client, err := net.DialUDP("udp6", nil, addr)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer client.Close()
+
+			// when: a browse asking for a unicast reply
+			query := ptrQuery()
+			query.Question[0].Qclass |= qClassCacheFlush
+			packet, err := query.Pack()
+			if err != nil {
+				t.Fatal(err)
+			}
+			if _, err := client.Write(packet); err != nil {
+				t.Fatal(err)
+			}
+
+			// then: an unanswered query can only be waited for
+			wait := 2 * time.Second
+			if !tc.answered {
+				wait = 300 * time.Millisecond
+			}
+			_ = client.SetReadDeadline(time.Now().Add(wait))
+			n, err := client.Read(make([]byte, 65536))
+			if tc.answered && err != nil {
+				t.Errorf("no answer: %v", err)
+			}
+			if !tc.answered && err == nil {
+				t.Errorf("answered with %d bytes", n)
+			}
+		})
 	}
 }
 
@@ -877,17 +990,8 @@ func TestJoinUdp6MulticastOnlySelected(t *testing.T) {
 	})
 
 	t.Run("a client joins only its selected one", func(t *testing.T) {
-		// given: two interfaces IPv6 can join on their own
-		var joinable []net.Interface
-		for _, iface := range ifaces {
-			if c, err := joinUdp6Multicast(NewInterfaceList([]net.Interface{iface}), nil); err == nil {
-				c.Close()
-				joinable = append(joinable, iface)
-			}
-		}
-		if len(joinable) < 2 {
-			t.Skip("needs two interfaces with IPv6 multicast")
-		}
+		// given
+		joinable := ipv6JoinableIfaces(t)
 		selected := joinable[0].Index
 
 		// when
@@ -953,6 +1057,51 @@ func TestJoinNoFamilyKeepsBrowsingSocketless(t *testing.T) {
 	}
 }
 
+func TestJoinOneFamilyIsEnough(t *testing.T) {
+	for _, tc := range []struct {
+		name   string
+		ipv4ok bool
+		ipv6ok bool
+	}{
+		{name: "IPv4 without IPv6", ipv4ok: true},
+		{name: "IPv6 without IPv4", ipv6ok: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			// given: joins that succeed for one family only
+			origIPv4, origIPv6 := joinIPv4, joinIPv6
+			t.Cleanup(func() { joinIPv4, joinIPv6 = origIPv4, origIPv6 })
+			joinIPv4 = func([]*NetInterface) (*ipv4.PacketConn, error) {
+				if !tc.ipv4ok {
+					return nil, errors.New("no IPv4 here")
+				}
+				pConn, _ := loopbackConn(t, "udp4")
+				return pConn.(*ipv4.PacketConn), nil
+			}
+			joinIPv6 = func([]*NetInterface, map[int]struct{}) (*ipv6.PacketConn, error) {
+				if !tc.ipv6ok {
+					return nil, errors.New("no IPv6 here")
+				}
+				pConn, _ := loopbackConn(t, "udp6")
+				return pConn.(*ipv6.PacketConn), nil
+			}
+
+			// when
+			c, err := newClient(applyOpts(SelectIPTraffic(IPv4AndIPv6), SelectIfaces(unjoinableIfaces)))
+
+			// then: a client on the family that joined
+			if err != nil || c == nil {
+				t.Fatalf("newClient = %v, %v", c, err)
+			}
+			if got := c.ipv4conn != nil; got != tc.ipv4ok {
+				t.Errorf("IPv4 socket = %v, want %v", got, tc.ipv4ok)
+			}
+			if got := c.ipv6conn != nil; got != tc.ipv6ok {
+				t.Errorf("IPv6 socket = %v, want %v", got, tc.ipv6ok)
+			}
+		})
+	}
+}
+
 func TestJoinFailureOfEveryRequestedFamilyIsAnError(t *testing.T) {
 	for _, traffic := range []IPType{IPv4, IPv6, IPv4AndIPv6} {
 		// when
@@ -963,6 +1112,23 @@ func TestJoinFailureOfEveryRequestedFamilyIsAnError(t *testing.T) {
 			t.Errorf("traffic %d: newClient = %v, %v, want an error", traffic, c, err)
 		}
 	}
+}
+
+// ipv6JoinableIfaces lists the interfaces IPv6 multicast can join on their
+// own, at least two.
+func ipv6JoinableIfaces(t *testing.T) []net.Interface {
+	t.Helper()
+	var joinable []net.Interface
+	for _, iface := range listMulticastInterfaces() {
+		if c, err := joinUdp6Multicast(NewInterfaceList([]net.Interface{iface}), nil); err == nil {
+			c.Close()
+			joinable = append(joinable, iface)
+		}
+	}
+	if len(joinable) < 2 {
+		t.Skip("needs two interfaces with IPv6 multicast")
+	}
+	return joinable
 }
 
 func TestEnumerationIgnoresIPv6Selection(t *testing.T) {
