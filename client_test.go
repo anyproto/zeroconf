@@ -50,24 +50,24 @@ func TestRecvLoopSurvivesTransientReadErrors(t *testing.T) {
 	}
 
 	calls := 0
-	readFrom := func(b []byte) (int, net.Addr, error) {
+	readFrom := func(b []byte) (int, int, error) {
 		calls++
 		switch {
 		case calls <= 2:
-			return 0, nil, fmt.Errorf("transient read error %d", calls)
+			return 0, 0, fmt.Errorf("transient read error %d", calls)
 		case calls == 3:
-			return copy(b, packet), nil, nil
+			return copy(b, packet), 0, nil
 		default:
 			<-ctx.Done()
-			return 0, nil, net.ErrClosed
+			return 0, 0, net.ErrClosed
 		}
 	}
 
-	msgCh := make(chan *dns.Msg, 1)
+	msgCh := make(chan receivedMsg, 1)
 	done := make(chan struct{})
 	go func() {
 		defer close(done)
-		recvLoop(ctx, readFrom, msgCh)
+		recvLoop(ctx, readFrom, false, nil, msgCh)
 	}()
 
 	select {
@@ -88,14 +88,14 @@ func TestRecvLoopStopsOnClosedConn(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
 	defer cancel()
 
-	readFrom := func(b []byte) (int, net.Addr, error) {
-		return 0, nil, fmt.Errorf("read udp4: %w", net.ErrClosed)
+	readFrom := func(b []byte) (int, int, error) {
+		return 0, 0, fmt.Errorf("read udp4: %w", net.ErrClosed)
 	}
 
 	done := make(chan struct{})
 	go func() {
 		defer close(done)
-		recvLoop(ctx, readFrom, make(chan *dns.Msg, 1))
+		recvLoop(ctx, readFrom, false, nil, make(chan receivedMsg, 1))
 	}()
 
 	select {

@@ -1,12 +1,14 @@
 package zeroconf
 
 import (
+	"errors"
 	"fmt"
 	"log"
 	"math/rand"
 	"net"
 	"os"
 	"runtime"
+	"slices"
 	"strings"
 	"sync"
 	"time"
@@ -27,9 +29,11 @@ var (
 )
 
 type serverOpts struct {
-	ttl          uint32
-	listenOn     IPType
-	writeTimeout time.Duration
+	ttl             uint32
+	listenOn        IPType
+	writeTimeout    time.Duration
+	linkLocalIfaces map[int]struct{}
+	ipv6Ifaces      map[int]struct{}
 }
 
 func applyServerOpts(options ...ServerOption) serverOpts {
@@ -69,6 +73,19 @@ func WriteTimeout(duration time.Duration) ServerOption {
 func ServerSelectIPTraffic(t IPType) ServerOption {
 	return func(o *serverOpts) {
 		o.listenOn = t
+	}
+}
+
+// ServerLinkLocalIPv6 makes an answer sent on one of the listed interfaces
+// carry that interface's own IPv6 link-local addresses, on top of the fixed
+// address list of RegisterProxy, and limits IPv6 traffic to them: IPv4 keeps
+// using every interface the server registered on. A link-local address is
+// only reachable through its own link, so it is never announced on another
+// interface.
+func ServerLinkLocalIPv6(ifIndexes ...int) ServerOption {
+	return func(o *serverOpts) {
+		o.linkLocalIfaces = indexSet(ifIndexes)
+		o.ipv6Ifaces = o.linkLocalIfaces
 	}
 }
 
@@ -193,6 +210,10 @@ type Server struct {
 	isShutdown     bool
 	ttl            uint32
 	writeTimeout   time.Duration
+	// linkLocalIfaces: see ServerLinkLocalIPv6
+	linkLocalIfaces map[int]struct{}
+	// ipv6Ifaces: see ServerLinkLocalIPv6; nil means all
+	ipv6Ifaces map[int]struct{}
 }
 
 // Constructs server structure
@@ -204,10 +225,12 @@ func newServer(ifaces []net.Interface, opts serverOpts) (*Server, error) {
 	ifaceList := NewInterfaceList(ifaces)
 
 	s := &Server{
-		interfaces:     ifaceList,
-		ttl:            opts.ttl,
-		writeTimeout:   opts.writeTimeout,
-		shouldShutdown: make(chan struct{}),
+		interfaces:      ifaceList,
+		ttl:             opts.ttl,
+		writeTimeout:    opts.writeTimeout,
+		shouldShutdown:  make(chan struct{}),
+		linkLocalIfaces: opts.linkLocalIfaces,
+		ipv6Ifaces:      opts.ipv6Ifaces,
 	}
 
 	var err error
@@ -219,7 +242,7 @@ func newServer(ifaces []net.Interface, opts serverOpts) (*Server, error) {
 	}
 
 	if (opts.listenOn & IPv6) > 0 {
-		s.ipv6conn, err = joinUdp6Multicast(ifaceList)
+		s.ipv6conn, err = joinUdp6Multicast(ifaceList, opts.ipv6Ifaces)
 		if err != nil {
 			log.Printf("[zeroconf] no suitable IPv6 interface: %s", err.Error())
 		}
@@ -366,6 +389,13 @@ func (s *Server) recv6(c *ipv6.PacketConn) {
 			backoff = 0
 			if cm != nil {
 				ifIndex = cm.IfIndex
+			}
+			if s.ipv6Ifaces != nil {
+				// the wildcard socket also takes unicast queries on
+				// other links; answer only on the selected ones
+				if _, ok := s.ipv6Ifaces[ifIndex]; !ok {
+					continue
+				}
 			}
 			_ = s.parsePacket(buf[:n], ifIndex, from)
 		}
@@ -714,26 +744,42 @@ func (s *Server) announceText() {
 }
 
 func (s *Server) unregister() error {
-	resp := new(dns.Msg)
-	resp.MsgHdr.Response = true
-	resp.Answer = []dns.RR{}
-	resp.Extra = []dns.RR{}
-	s.composeLookupAnswers(resp, 0, 0, true)
-	// cleanup ifaces we have NEVER written successfully. No need to unregister them
-
-	return s.multicastResponse(resp, 0, NetInterfaceStateFlagMulticastJoined, NetInterfaceStateFlagMessageSent)
+	// one goodbye per interface: an interface may have announced its own
+	// addresses (see ServerLinkLocalIPv6), and each record needs its goodbye
+	var errs []error
+	for _, intf := range s.interfaces {
+		resp := new(dns.Msg)
+		resp.MsgHdr.Response = true
+		resp.Answer = []dns.RR{}
+		resp.Extra = []dns.RR{}
+		s.composeLookupAnswers(resp, 0, intf.Index, true)
+		// cleanup ifaces we have NEVER written successfully. No need to unregister them
+		if err := s.multicastResponse(resp, intf.Index, NetInterfaceStateFlagMulticastJoined, NetInterfaceStateFlagMessageSent); err != nil {
+			errs = append(errs, err)
+		}
+	}
+	return errors.Join(errs...)
 }
 
 func (s *Server) appendAddrs(list []dns.RR, ttl uint32, ifIndex int, flushCache bool) []dns.RR {
-	v4 := s.service.AddrIPv4
-	v6 := s.service.AddrIPv6
+	_, linkLocal := s.linkLocalIfaces[ifIndex]
+	linkLocal = linkLocal && ifIndex != 0
+	// clipped: appends below must copy, not write into the shared service
+	// entry, which concurrent answers on other interfaces read
+	v4 := slices.Clip(s.service.AddrIPv4)
+	v6 := slices.Clip(s.service.AddrIPv6)
 	if len(v4) == 0 && len(v6) == 0 {
-		iface, _ := net.InterfaceByIndex(ifIndex)
-		if iface != nil {
-			a4, a6 := addrsForInterface(iface)
+		if addrs, err := interfaceAddrs(ifIndex); err == nil {
+			a4, a6 := splitAddrs(addrs)
 			v4 = append(v4, a4...)
-			v6 = append(v6, a6...)
+			if !linkLocal {
+				// a link-local interface announces its link-local only
+				v6 = append(v6, a6...)
+			}
 		}
+	}
+	if linkLocal {
+		v6 = appendLinkLocal(v6, ifIndex)
 	}
 	if ttl > 0 {
 		// RFC6762 Section 10 says A/AAAA records SHOULD
@@ -772,9 +818,46 @@ func (s *Server) appendAddrs(list []dns.RR, ttl uint32, ifIndex int, flushCache 
 	return list
 }
 
-func addrsForInterface(iface *net.Interface) ([]net.IP, []net.IP) {
+// interfaceAddrs lists an interface's addresses by index. A var so tests can
+// stub the lookup.
+var interfaceAddrs = func(ifIndex int) ([]net.Addr, error) {
+	iface, err := net.InterfaceByIndex(ifIndex)
+	if err != nil {
+		return nil, err
+	}
+	return iface.Addrs()
+}
+
+// appendLinkLocal adds the IPv6 link-local addresses of interface ifIndex
+// that v6 does not hold yet.
+func appendLinkLocal(v6 []net.IP, ifIndex int) []net.IP {
+	addrs, err := interfaceAddrs(ifIndex)
+	if err != nil {
+		return v6
+	}
+	for _, address := range addrs {
+		ipnet, ok := address.(*net.IPNet)
+		if !ok || ipnet.IP.To4() != nil || !ipnet.IP.IsLinkLocalUnicast() {
+			continue
+		}
+		known := false
+		for _, ip := range v6 {
+			if ip.Equal(ipnet.IP) {
+				known = true
+				break
+			}
+		}
+		if !known {
+			v6 = append(v6, ipnet.IP)
+		}
+	}
+	return v6
+}
+
+// splitAddrs sorts an interface's addresses into IPv4 and IPv6, the IPv6
+// link-local ones only when it has no global address.
+func splitAddrs(addrs []net.Addr) ([]net.IP, []net.IP) {
 	var v4, v6, v6local []net.IP
-	addrs, _ := iface.Addrs()
 	for _, address := range addrs {
 		if ipnet, ok := address.(*net.IPNet); ok && !ipnet.IP.IsLoopback() {
 			if ipnet.IP.To4() != nil {
@@ -884,6 +967,8 @@ func (s *Server) multicastResponse(msg *dns.Msg, ifIndex int, requiredFlags ...N
 		// See https://pkg.go.dev/golang.org/x/net/ipv6#pkg-note-BUG
 		// As of Golang 1.18.4
 		// On Windows, the ControlMessage for ReadFrom and WriteTo methods of PacketConn is not implemented.
+		// IPv6 goes only where the group was joined (see ServerLinkLocalIPv6)
+		requiredFlags := append([]NetInterfaceStateFlag{NetInterfaceStateFlagMulticastJoined}, requiredFlags...)
 		var wcm ipv6.ControlMessage
 		if ifIndex != 0 {
 			if v := s.interfaces.GetByIndex(ifIndex); v != nil && v.HasFlags(NetInterfaceScopeIPv6, requiredFlags...) {

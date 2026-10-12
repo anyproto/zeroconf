@@ -3,6 +3,7 @@ package zeroconf
 import (
 	"fmt"
 	"net"
+	"net/netip"
 	"sync"
 	"time"
 )
@@ -110,6 +111,17 @@ type ServiceEntry struct {
 	Expiry   time.Time `json:"expiry"`   // Expiry of the service entry, will be converted to a TTL value
 	AddrIPv4 []net.IP  `json:"-"`        // Host machine IPv4 address
 	AddrIPv6 []net.IP  `json:"-"`        // Host machine IPv6 address
+	// AddrIPv6Zoned holds the same IPv6 addresses as AddrIPv6, a link-local
+	// one zoned with the decimal index of the interface the answer arrived
+	// on, so it can be dialed. A link-local address is left out when the
+	// receiving interface is unknown (Windows reports none).
+	AddrIPv6Zoned []netip.Addr `json:"-"`
+	// LinkIndex is the interface an IPv6 answer arrived on when that
+	// interface was selected with SelectIPv6Ifaces; 0 otherwise. Such an
+	// entry describes that link only and has at least one zoned link-local
+	// address in AddrIPv6Zoned: answers on other links are delivered on
+	// their own.
+	LinkIndex int `json:"-"`
 }
 
 // newServiceEntry constructs a ServiceEntry.
